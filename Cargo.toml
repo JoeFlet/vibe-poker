@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/poker-engine",
+    "crates/poker-client",
+]

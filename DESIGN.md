@@ -1,0 +1,672 @@
+# Poker Engine Design Document
+
+## Goals
+
+- **High-throughput simulation**: capable of millions of hands/second for AI training (MCCFR, RL)
+- **Clean AI interface**: plug-in agents with a simple action/observation API
+- **Texas Hold'em first**: 6-max and heads-up, with architecture open to other variants
+- **Correctness over cleverness at the boundary**: fast core, safe surface API
+
+## Non-Goals
+
+- Real-money handling
+- Networking and UI live in **companion crates** (see "Companion Projects"
+  below), not in this engine crate. The engine stays a pure library.
+- Exhaustive game variant support at v1 — MVP is Texas Hold'em only, but the ruleset boundary (`BettingRules`, `Street`, action validation) is designed to be swappable
+
+---
+
+## Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────┐
+│                    AI / Test Layer                   │
+│   AgentInterface  ·  Evaluators  ·  Training Loops   │
+├──────────────────────────────────────────────────────┤
+│                   Game Layer                         │
+│   GameState  ·  ActionSpace  ·  BettingRules         │
+├──────────────────────────────────────────────────────┤
+│                   Core Layer                         │
+│   Card / Deck  ·  HandEvaluator  ·  Pot / Equity     │
+└──────────────────────────────────────────────────────┘
+```
+
+**Language**: Rust for all engine layers. Python bindings via PyO3 for AI agent code if needed.
+
+---
+
+## Core Layer
+
+### Card Representation
+
+Use a packed 8-bit integer per card: `rank (4 bits) | suit (2 bits)`.
+
+```
+Rank: 2=0 … A=12   Suit: clubs=0, diamonds=1, hearts=2, spades=3
+Card: u8  (0–51)
+Hand: u64 bit-mask  (one bit per card in the 52-card deck)
+```
+
+A `u64` hand mask enables O(1) set operations (union, intersection, complement) via bitwise ops. This representation is directly compatible with lookup-table evaluators.
+
+### Hand Evaluator
+
+Integrate **PokerHandEvaluator (PHEval)** as the evaluation back-end:
+- 7-card evaluation in ~30 ns via precomputed lookup tables
+- MIT licensed, C/C++ with available bindings
+
+Wrap it behind a trait/interface so the implementation can be swapped:
+
+```rust
+pub trait HandEvaluator {
+    fn rank_7(&self, cards: [Card; 7]) -> HandRank;
+    fn rank_5(&self, cards: [Card; 5]) -> HandRank;
+}
+```
+
+`HandRank` is a `u16` where higher = better, enabling direct comparison.
+
+### Deck
+
+A Fisher-Yates shuffle over a `[Card; 52]` array. Use a fast PRNG (e.g., `SmallRng` / xoshiro256**) — `rand::thread_rng` is fine for correctness but too slow for bulk simulation.
+
+---
+
+## Game Layer
+
+### GameState
+
+Immutable-ish struct representing a complete hand snapshot. Cloning must be cheap for tree search.
+
+```rust
+pub struct GameState {
+    pub street: Street,           // Preflop, Flop, Turn, River, Showdown
+    pub board: [Option<Card>; 5],
+    pub players: [PlayerState; MAX_PLAYERS],
+    pub pot: Pot,
+    pub action_on: SeatIndex,
+    pub deck: Deck,               // remaining cards (for deal-out)
+}
+
+pub struct PlayerState {
+    pub stack: u32,               // chips in big blind units (integer arithmetic only)
+    pub hole_cards: Option<[Card; 2]>,
+    pub bet_this_street: u32,
+    pub status: PlayerStatus,     // Active, Folded, AllIn
+}
+```
+
+**Integer chip arithmetic only** — no floats anywhere in the game layer. Use big-blind units as the base denomination.
+
+### Pot
+
+Track side pots explicitly from the start. This avoids expensive reconstruction at showdown.
+
+```rust
+pub struct Pot {
+    pub main: u32,
+    pub side: SmallVec<[SidePot; 4]>,  // rare; most hands have 0-1 side pots
+}
+```
+
+### Action Space
+
+```rust
+pub enum Action {
+    Fold,
+    Check,
+    Call,
+    Raise(u32),   // total bet size, validated against min-raise rules
+    AllIn,
+}
+```
+
+The engine validates actions and returns `Err` for illegal moves. Agents always receive a `LegalActions` struct listing what is currently valid.
+
+### Betting Rules
+
+Encapsulated in a `BettingRules` struct (passed at game construction):
+
+```rust
+pub struct BettingRules {
+    pub variant: BetVariant,       // NoLimit, PotLimit, FixedLimit
+    pub small_blind: u32,
+    pub big_blind: u32,
+    pub ante: u32,
+    pub max_players: usize,
+    pub allow_straddle: bool,
+}
+```
+
+---
+
+## AI / Test Layer
+
+### AgentInterface
+
+The only contract an AI must satisfy:
+
+```rust
+pub trait Agent {
+    fn act(&mut self, obs: &Observation) -> Action;
+}
+```
+
+`Observation` exposes what the agent is *allowed to know*:
+
+```rust
+pub struct Observation {
+    pub hole_cards: [Card; 2],
+    pub board: &[Card],
+    pub pot: &Pot,
+    pub legal_actions: LegalActions,
+    pub players: &[PublicPlayerState],  // stacks, bets — no private info
+    pub street: Street,
+    pub position: SeatIndex,
+}
+```
+
+This boundary enforces perfect information hiding: agents cannot read opponent hole cards unless it's showdown.
+
+### Simulation Runner
+
+High-throughput batch runner for training loops:
+
+```rust
+pub struct SimRunner {
+    pub config: SimConfig,
+    pub agents: Vec<Box<dyn Agent>>,
+}
+
+impl SimRunner {
+    /// Run N hands, return per-agent chip deltas
+    pub fn run(&mut self, hands: usize) -> Vec<i64>;
+
+    /// Parallel run across thread pool (agents must be Send)
+    pub fn run_parallel(&mut self, hands: usize, threads: usize) -> Vec<i64>;
+}
+```
+
+For RL/CFR training, expose a lower-level `GameTree` iterator that streams `(state, legal_actions)` pairs without materialising full game objects.
+
+### Built-in Test Agents
+
+| Agent | Description |
+|---|---|
+| `RandomAgent` | Uniform random over legal actions |
+| `CallingStation` | Always calls |
+| `ScriptedAgent` | Follows a provided action script — deterministic for unit tests |
+| `CFRAgent` | Wraps a pre-trained blueprint strategy (see below) |
+
+---
+
+## Solver & Exploit Architecture
+
+The AI strategy stack is built in two layers. The lower layer produces a near-GTO
+blueprint via native **Monte Carlo CFR** trained on this engine. The upper layer
+observes opponent play over time and mixes **best-response** adjustments against
+inferred opponent models on top of the blueprint to maximize expected value.
+
+Using OpenSpiel was considered as a shortcut to a solver, but rejected: owning the
+trainer natively means the solver sees the same rule edge cases (TDA 43 / 47A,
+dead-hand blinds, side pots) that the engine already implements, and the exploit
+layer can share the engine's `Observation` / info-set representation directly
+rather than bridging across an external process.
+
+### Modules
+
+- `crate::abstraction` — card abstractions (Stage A: preflop 169-class canonical
+  form, done). Postflop buckets are deferred until the equity / distribution work
+  lands.
+- `crate::solver::action` — `AbstractAction` enum, the discrete action set the
+  solver operates on.
+- `crate::solver::info_set` — `InfoSet` key: `(street, relative_position, bucket,
+  history)`. Rotation-invariant so symmetric decisions share regret storage.
+- `crate::solver::strategy` — `StrategyAgent` trait, `ActionProbs` distribution,
+  `StrategyAdapter` (engine `Agent` impl), and `UniformRandomStrategy` baseline.
+- `crate::game::tree` — `GameTree` pausable stepper over a single hand, the
+  substrate the trainer iterates over. See below.
+
+### GameTree — pausable hand stepper
+
+`Engine::run_hand` plays a full hand against fixed agents. CFR needs the
+inverse: pause at a decision, clone the state, try different actions, measure
+terminal utility across branches. `GameTree` is that inverse.
+
+Shape:
+
+```rust
+pub enum NodeKind {
+    Decision { seat: SeatIndex },
+    Terminal,
+}
+
+pub struct GameTree {
+    pub state: GameState,
+    pub deck: Deck,
+    // private: Phase::{Decision{ current, has_responded }, Terminal{ chip_deltas }}
+}
+
+impl GameTree {
+    pub fn new<E: HandEvaluator>(engine: &Engine<E>, ..., sink: &mut dyn EventSink) -> Self;
+    pub fn current(&self) -> NodeKind;
+    pub fn legal_actions<E>(&self, engine: &Engine<E>) -> Option<LegalActions>;
+    pub fn observation_owned<E>(&self, engine: &Engine<E>) -> Option<OwnedObservation>;
+    pub fn apply_action<E>(&mut self, engine: &Engine<E>, action: Action, sink: &mut dyn EventSink);
+    pub fn utilities(&self) -> Option<&[i64]>;
+    pub fn into_result(self, hand_id: HandId) -> HandResult;
+}
+// Plus `#[derive(Clone)]`.
+```
+
+Invariants the trainer relies on:
+
+- **Chance-through-clone determinism.** The `Deck` lives inside the tree.
+  Cloning the tree clones the deck, so two branches from the same decision
+  point produce the same subsequent board and hole-card deals. This is what
+  makes external-sampling MCCFR's branch comparisons apples-to-apples without
+  having to pre-deal cards into a separate structure.
+- **No chance nodes in the public surface.** Board deals and showdown
+  resolution happen inside `apply_action` between one decision and the next.
+  The consumer sees only Decision → Decision → ... → Terminal.
+- **Bug-compatible with `run_hand`.** The stepper reuses the same
+  `Engine::{post_blinds, deal_hole_cards, apply_action, compute_legal_actions,
+  resolve_showdown, ...}` helpers (now `pub(crate)`). TDA rule handling —
+  cumulative short all-ins, dead-hand blinds, canonical BB first-to-act — is
+  inherited rather than reimplemented.
+
+The MCCFR trainer (step 12) will call `apply_action` in the outer path, and
+`clone` + `apply_action` on interior nodes for branch evaluation.
+
+### MCCFR trainer
+
+`crate::solver::mccfr::MccfrTrainer` is the native external-sampling CFR
+trainer. It is heads-up only for now; multi-player is deferred to the
+exploit layer (see rationale below).
+
+Per training iteration:
+
+1. For each traverser seat (0 and 1), construct a fresh `GameTree` with a
+   seed-determined deal.
+2. Walk the tree recursively. At a Decision node for the traverser,
+   enumerate every legal `AbstractAction`, clone the tree, and recurse each
+   branch to get a per-action utility. At a Decision node for the opponent,
+   sample one action from the opponent's current (regret-matched) strategy.
+   At a Terminal, return the traverser's net chip P/L.
+3. At each traverser info set, accumulate counterfactual regret
+   `regret[a] += branch_value[a] - node_value` and strategy-sum
+   `strategy_sum[a] += current_strategy[a]`.
+
+Storage lives in `RegretTable`: `HashMap<InfoSet, RegretEntry>`. Each entry
+holds `regret: [f32; 4]`, `strategy_sum: [f32; 4]`, and a visit counter.
+Regret matching (`regret_matching`) turns regret into the next iteration's
+strategy; normalising `strategy_sum` (via `BlueprintStrategy`) yields the
+time-averaged strategy, which is what converges to equilibrium.
+
+`BlueprintStrategy` implements `StrategyAgent`, so trained policies plug
+directly into the same `StrategyAdapter` pipeline used by
+`UniformRandomStrategy`. Info sets unvisited during training fall back to
+uniform over the legal subset.
+
+#### Why heads-up only
+
+CFR in 3+ player games converges only to a correlated equilibrium, not a
+Nash equilibrium — and in poker, opponents rarely play correlated
+strategies. Modern multi-player systems (Pluribus etc.) train a heads-up
+blueprint and use depth-limited real-time search plus opponent modeling at
+the table. That is the shape the exploit layer will take on top of this
+trainer; building the multi-player trainer before the exploit layer would
+be wasted motion.
+
+#### Known limitations (tracked, not blocking)
+
+- **Coarse postflop buckets**: postflop info sets all share `bucket = 0`
+  until the postflop card-abstraction work (step 14+ material) lands, so
+  the trainer's postflop play will be weak. Preflop buckets (169-class
+  canonical) are complete and provide the meaningful training signal.
+- **Single raise size**: the action abstraction exposes only a pot-sized
+  raise. Richer sizing (half-pot, two-pot, all-in as distinct sizes) is a
+  future widening of `AbstractAction`; the trainer code generalises over
+  any finite set.
+- **Convergence diagnostics**: no exploitability computation yet. The
+  current convergence test is a head-to-head smoke test (blueprint vs
+  uniform random, 1000 iters ⇒ positive chip EV over 2000 hands). A
+  best-response solver will be added before the trainer is declared
+  production-ready.
+
+### Action abstraction
+
+Stage 1 uses 4 abstract actions: `Fold`, `Call` (includes Check when nothing is
+owed), `Raise` (pot-sized), and `AllIn`. This is the minimum viable set for
+preflop trees and small experiments. Additional raise sizings (half-pot,
+two-pot) will be added when training scale requires finer granularity — the
+enum is `#[repr(u8)]` and indexed by `AbstractAction::index()` so regret tables
+extend by widening a single dimension.
+
+`legal_abstract_actions(&LegalActions)` computes the legal subset for a given
+decision point. Fold is excluded when the player can check: burning probability
+on a strictly-dominated action would waste regret-storage capacity during
+training.
+
+### Concretization
+
+`concretize(AbstractAction, &Observation) -> Action` maps an abstract choice to
+a concrete engine `Action`. Pot-sized raise target:
+
+```
+pot_after_call = pot.total() + sum(player.bet_this_street)
+target         = clamp(min_raise + pot_after_call, min_raise, max_raise)
+```
+
+Illegal abstract actions fall back to the safest legal alternative (Call or
+Check). Trained strategies should assign probability 0 to illegal actions; the
+fallback is a defensive last line, not the primary correctness mechanism.
+
+### InfoSet key
+
+```rust
+pub struct InfoSet {
+    pub street: Street,
+    pub position: Position,   // 0 = dealer, 1 = SB, 2 = BB, ... rotation-invariant
+    pub bucket: u16,          // PreflopClass::index() preflop; 0 postflop (TODO)
+    pub history: SmallVec<[AbstractAction; 12]>,
+}
+```
+
+Two decisions share an `InfoSet` iff they are interchangeable from the acting
+player's perspective. Rotation-invariance means a button-vs-BB decision with
+the same cards and action sequence reuses regret regardless of which absolute
+seats are involved — this is the entire reason `Observation` now carries a
+`dealer` field.
+
+The `history` field is a `SmallVec` with 12 inline slots; deeper trees spill to
+the heap but are rare. Tuning this capacity is a performance knob, not a
+correctness concern.
+
+### StrategyAgent and the adapter
+
+```rust
+pub trait StrategyAgent: Send + Sync {
+    fn strategy(&self, info: &InfoSet, legal: &LegalActions) -> ActionProbs;
+}
+```
+
+`StrategyAdapter<S: StrategyAgent>` wraps any `StrategyAgent` into an engine
+`Agent`, threading an abstract-action history across the hand and clearing it
+on `on_hand_start`. This is the single bridge between the solver's abstract
+world and the engine's concrete world: trainers, blueprints, and exploit
+policies all share it.
+
+`UniformRandomStrategy` is a trivial `StrategyAgent` used as a baseline and as
+a smoke test — it also serves as the starting policy for MCCFR regret
+minimization.
+
+### Exploit layer (planned)
+
+Long-term vision: combine the GTO blueprint with opponent-specific deviations.
+
+- **Opponent profiling** — a passive observer (`EngineEvent` consumer) builds a
+  running model per seat: VPIP / PFR / AF baseline, plus conditional stats
+  (fold-to-3bet, c-bet frequency, etc.). The existing `StatsSink`
+  infrastructure is the obvious substrate.
+- **Best-response mixing** — at decision time, combine the blueprint's
+  `ActionProbs` with a best-response distribution computed against the opponent
+  model. The mixing weight trades off exploitation against exploitability:
+  blueprint-only is unexploitable but untuned; pure best-response is maximally
+  exploitative but blows up against a balanced opponent.
+- **Attack surface** — because every decision flows through the `StrategyAgent`
+  trait, exploitative strategies slot in as another implementor without any
+  engine change. The `Observation` already carries the full public state the
+  exploit layer needs to index its opponent model.
+
+This layering is deliberate: GTO as the anchor, exploit as a correction. It
+matches how strong human players think about the game and keeps the solver
+component pure (it never needs to know about opponent models).
+
+---
+
+## Performance Targets
+
+| Operation | Target |
+|---|---|
+| Hand evaluation (7-card) | < 50 ns |
+| Full hand simulation (2 players) | < 500 ns |
+| Bulk simulation (parallel, 8 cores) | > 5M hands/sec |
+| Game state clone | < 20 ns |
+| Action validation | < 10 ns |
+
+These are achievable with lookup-table eval + integer arithmetic + no heap allocation in the hot path.
+
+### Hot Path Rules
+
+1. No heap allocation during a hand (pre-allocate; reuse game state structs)
+2. No virtual dispatch in the core layer (use generics / monomorphisation)
+3. No floating point (stacks are integer chip counts)
+4. No locking on the game state (each simulation thread owns its state)
+
+---
+
+## Open Source References
+
+| Project | Role | URL |
+|---|---|---|
+| **PokerHandEvaluator (PHEval)** | Hand evaluation back-end | https://github.com/HenryRLee/PokerHandEvaluator |
+| **OpenSpiel** | CFR solvers + game-theory baselines | https://github.com/deepmind/open_spiel |
+| **RLCard** | RL environment reference + datasets | https://github.com/datamllab/rlcard |
+| **treys** | Python prototyping / sanity checks | https://github.com/ihendley/treys |
+| **poker_ai (fedden)** | Pluribus MCCFR reference implementation | https://github.com/fedden/poker_ai |
+
+---
+
+## Persistence
+
+AIs may persist data to disk using **MessagePack** (`rmp-serde` crate) for both performance and simplicity.
+
+Two categories of AI state with different lifetimes:
+
+| Category | Examples | Lifetime |
+|---|---|---|
+| **Durable** | trained strategy profiles, hand history logs | persists across runs |
+| **Transient** | per-opponent player profiles, session reads | reset between runs, retained between hands |
+
+The `Agent` trait exposes optional lifecycle hooks to support this:
+
+```rust
+pub trait Agent {
+    fn act(&mut self, obs: &Observation) -> Action;
+
+    /// Called once before the first hand of a run. Load durable state here.
+    fn on_run_start(&mut self, config: &RunConfig) {}
+
+    /// Called after the last hand of a run. Flush durable state here.
+    fn on_run_end(&mut self) {}
+
+    /// Called between hands. Transient per-hand state should be reset here.
+    fn on_hand_start(&mut self, hand_id: HandId) {}
+
+    /// Called at showdown / hand conclusion with full outcome.
+    fn on_hand_end(&mut self, result: &HandResult) {}
+}
+```
+
+All hooks have default no-op implementations so simple agents don't need to implement them.
+
+---
+
+## Observability & Replay
+
+The engine emits a structured event stream during every hand. Consumers subscribe via a channel or callback — the engine itself does not log or store anything.
+
+### Event Types
+
+```rust
+pub enum EngineEvent {
+    HandStarted   { hand_id: HandId, dealer: SeatIndex, deck_seed: u64 },
+    CardsDealt    { seat: SeatIndex, hole_cards: [Card; 2] },
+    BoardDealt    { street: Street, cards: Vec<Card> },
+    ActionTaken   { seat: SeatIndex, action: Action, pot_after: u32 },
+    PlayerAllIn   { seat: SeatIndex, amount: u32 },
+    HandEnded     { result: HandResult },
+}
+```
+
+`HandResult` includes the full board, each player's hole cards, and per-seat chip deltas.
+
+### Replay & Determinism
+
+Every hand records two seeds at `HandStarted`:
+- **`deck_seed`** — seeds the shuffler RNG exclusively
+- Agents are seeded independently at construction and their seeds are opaque to the engine
+
+This separation means:
+1. Replaying a hand with the same `deck_seed` always produces the same board and deal, regardless of agent behavior
+2. Agent RNG cannot accidentally influence (or be reverse-engineered from) the deck order
+3. Bugs can be reproduced by pinning `deck_seed` without needing to replay the full agent state
+
+The `SimRunner` accepts an optional `deck_seed` override for deterministic replay:
+
+```rust
+pub struct SimConfig {
+    pub hands: usize,
+    pub deck_seed: Option<u64>,   // None = random per hand; Some(n) = fixed seed for all hands
+    pub event_sink: Option<Box<dyn EventSink>>,
+}
+
+pub trait EventSink: Send {
+    fn on_event(&mut self, event: &EngineEvent);
+}
+```
+
+Built-in sinks: `NullSink` (default, zero overhead), `VecSink` (collects to memory for tests), `FileSink` (streams to MessagePack file for post-hoc analysis).
+
+---
+
+## Tooling: CLI Reporter
+
+The primary user-facing tool for comparing AIs is a CLI binary (`poker_report`) that drives `SimRunner` and prints per-seat statistics.
+
+### Stats collected (`StatsSink`)
+
+`StatsSink` implements `EventSink` and accumulates per-seat counters across a run.
+
+| Stat | Definition |
+|---|---|
+| **Win%** | Hands with a positive chip delta / hands dealt |
+| **Chip EV** | Total chip delta / hands dealt (bb/hand when stacks are in BB units) |
+| **VPIP** | Voluntarily Put money In Pot — % of hands where seat called or raised preflop |
+| **PFR** | PreFlop Raise % — % of hands where seat raised or went all-in preflop |
+| **AF** | Aggression Factor — (raises + all-ins) / calls across all streets |
+
+VPIP and PFR are computed by tracking `ActionTaken` events while on the Preflop street (inferred from `HandStarted` / `BoardDealt` event ordering).
+
+### Planned CLI flags
+
+```
+poker_report [OPTIONS]
+
+Options:
+  --hands  N               Number of hands to simulate [default: 1000]
+  --agents <list>          Comma-separated agent specs: calling, random:<seed>
+  --stack  N               Starting stack per seat [default: 200]
+  --blinds small/big       Blind levels [default: 1/2]
+  --seed   N               Base deck seed (omit for random)
+  --threads N              Parallel threads [default: 1]
+```
+
+### Planned GUI (deferred)
+
+A graphical viewer (`egui`/`eframe`) will be added after the CLI reporter is stable. It will load `FileSink` logs and step through hands event-by-event, rendering a card table with hole cards, board, pot sizes, and action history.
+
+---
+
+## Companion Projects
+
+The engine crate (`poker`) is a pure library: deterministic, dependency-light,
+no I/O beyond the optional `FileSink` codec. Anything user-facing lives in a
+sibling crate so the engine stays clean and the boundary stays testable.
+
+Planned siblings (Cargo workspace, separate crates):
+
+- **`poker-server`** — authoritative game host. Owns the `Engine`, accepts
+  client connections (TCP / WebSocket), routes `Action`s in and broadcasts
+  `EngineEvent`s out. Same wire types as the in-process API; serialisation
+  via the existing `serde` derives. Connected clients can be humans or bots
+  written against the same `Agent` trait.
+- **`poker-client`** — desktop GUI (egui/eframe). Renders a card table from
+  an `EngineEvent` stream, whether the stream comes from a `FileSink` log
+  (replay) or a live `poker-server` connection (play). Replay viewer and
+  live client share the same rendering layer.
+- **`poker-bots`** — concrete bot implementations beyond the test agents in
+  `poker::agent`. Houses the diverse opponent set used by the in-house
+  dataset run (step 17). Kept separate so iteration on bots doesn't churn
+  the engine crate.
+
+Wire format and protocol details TBD when `poker-server` lands; default
+plan is MessagePack over WebSocket with the engine's existing event types
+serving as the schema source of truth.
+
+---
+
+## Suggested Build Order
+
+1. **Card + Deck + HandEvaluator** — unit-test against known hands ✅
+2. **GameState + BettingRules** — property-test with `RandomAgent` vs `RandomAgent` ✅
+3. **Pot + showdown resolution** — side-pot cases exhaustively tested ✅
+4. **Event system + `VecSink` / `FileSink`** — wired in from the start ✅
+5. **SimRunner single-threaded + parallel** — benchmarked ✅
+6. **Agent lifecycle hooks + MessagePack persistence** ✅
+7. **`StatsSink` + CLI reporter** (`poker_report` binary) ✅
+8. **Fast hand evaluator** — `RsPokerEvaluator` via the `rs_poker` crate
+   (pure Rust, ~50 ns / 7-card, ~36× faster than the naive reference) ✅
+9. **Card abstraction Stage A** — 169-class preflop canonical form
+   (`crate::abstraction::PreflopClass`). Postflop equity buckets deferred. ✅
+10. **Solver scaffolding** — `AbstractAction`, `InfoSet`, `StrategyAgent`,
+    `StrategyAdapter`, `UniformRandomStrategy` ✅
+11. **Game-tree iterator** — `GameTree` stepper with cheap cloning and
+    deterministic chance-through-clone, for CFR branch comparisons ✅
+12. **Native MCCFR trainer** — regret tables keyed by `InfoSet`, external
+    sampling over the `GameTree` ✅
+13. **Blueprint persistence** — serde-derive `InfoSet` / `RegretEntry` /
+    `RegretTable`; on-disk envelope (`solver::persistence::BlueprintFile`)
+    carries a schema version and an abstraction tag, both checked on load
+    so stale tables fail loudly. MessagePack codec (`rmp-serde`) reused
+    from `FileSink` rather than introducing a second binary format. ✅
+14. **Multi-player correctness pass** — fuzz + targeted tests at 2/3/4/6
+    seats covering chip conservation under randomized play, 3-way all-in
+    side-pot eligibility bounds, persistent-stack busting at 6-max, and
+    a 6-max mixed-agent long-run. Lives in
+    `tests/multi_player_correctness.rs`. ✅
+15. **CLI training binary** — `poker_train` runs MCCFR for N iterations and
+    writes a versioned blueprint; `poker_play` loads one and plays it
+    against bots (spec: `blueprint`, `calling`, `random:<seed>`), printing
+    the same `print_report` table as `poker_report`. Both live in
+    `src/bin/`. Train→save→load→play is a shippable end-to-end loop. ✅
+16. **`egui` replay viewer** — `poker-client --replay <path>` loads a
+    `FileSink` log (via the new `read_event_log` on the engine) and lets the
+    user scrub events with a cursor. Each frame renders a `Snapshot` derived
+    from `events[..=cursor]`: hand id / dealer / street / pot, board cards,
+    per-seat hole cards + folded/all-in/committed, action log, and the
+    `HandResult` block. Ships the first rendering layer; will be reused by
+    `poker-client` for live play. `poker_play --log <path>` fans the live
+    run through a `TeeSink` so stats and a durable log come from one pass. ✅
+17. **In-house opponent dataset** ← current — drive long `SimRunner` sessions with a
+    diverse bot pool (calling station, maniac, TAG, LAG, nit, tilt-prone,
+    blueprint-mix) and an aggregator over the resulting event logs. Targets:
+    - per-seat **VPIP**, **PFR**, **AF**, **c-bet %**, **fold-to-3bet**,
+      **WTSD** (already have most via `StatsSink`).
+    - **class-conditional** response distributions: how each bot's frequencies
+      shift when an opponent is labelled maniac vs. station vs. nit. Requires
+      running every bot against every other bot and bucketing by opponent
+      class.
+    - **session-windowed** stats over rolling N-hand windows to surface
+      time-correlated drift (e.g., post-loss VPIP inflation). The aggregator
+      reads `FileSink` logs, so any future client/server traffic captured to
+      the same format slots in unchanged.
+    - This is the dog-food dataset; importing external hand histories is a
+      later option, not a prerequisite.
+18. **Exploit layer** — opponent profiling consumer on `EngineEvent` using
+    the stat schema validated in step 17, plus best-response mixing with the
+    MCCFR blueprint. Mixing weight trades exploitation against exploitability.
+19. **`poker-server` + `poker-client`** — companion crates (see above).
+    Server hosts hands; client renders them via the step-16 layer. Bots
+    connect via the same `Agent` trait, exercised over the wire.
