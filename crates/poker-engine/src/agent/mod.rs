@@ -1,5 +1,6 @@
 pub mod builtin;
 pub mod human;
+pub mod personas;
 
 use crate::core::Card;
 use crate::game::{Action, EngineEvent, HandId, HandResult, LegalActions, Pot, SeatIndex, Street};

@@ -2,6 +2,7 @@ use clap::Parser;
 
 use poker_engine::agent::builtin::{CallingStation, RandomAgent};
 use poker_engine::agent::human::HumanAgent;
+use poker_engine::agent::personas::{Lag, Maniac, Nit, Tag, TiltProne};
 use poker_engine::agent::Agent;
 use poker_engine::core::RsPokerEvaluator;
 use poker_engine::game::BettingRules;
@@ -61,6 +62,11 @@ enum AgentSpec {
     Calling,
     Random(u64),
     Human,
+    Nit(u64),
+    Tag(u64),
+    Lag(u64),
+    Maniac(u64),
+    TiltProne(u64),
 }
 
 impl AgentSpec {
@@ -72,14 +78,25 @@ impl AgentSpec {
         if s == "human" {
             return Ok(AgentSpec::Human);
         }
-        if let Some(seed_str) = s.strip_prefix("random:") {
-            let seed: u64 = seed_str
-                .parse()
-                .map_err(|_| format!("invalid random seed in '{s}'"))?;
-            return Ok(AgentSpec::Random(seed));
+        for (name, ctor) in [
+            ("random", AgentSpec::Random as fn(u64) -> AgentSpec),
+            ("nit", AgentSpec::Nit),
+            ("tag", AgentSpec::Tag),
+            ("lag", AgentSpec::Lag),
+            ("maniac", AgentSpec::Maniac),
+            ("tilt", AgentSpec::TiltProne),
+        ] {
+            let prefix = format!("{name}:");
+            if let Some(seed_str) = s.strip_prefix(&prefix) {
+                let seed: u64 = seed_str
+                    .parse()
+                    .map_err(|_| format!("invalid seed in '{s}'"))?;
+                return Ok(ctor(seed));
+            }
         }
         Err(format!(
-            "unknown agent '{s}' — valid options: calling, random:<seed>, human"
+            "unknown agent '{s}' — valid options: calling, random:<seed>, human, \
+             nit:<seed>, tag:<seed>, lag:<seed>, maniac:<seed>, tilt:<seed>"
         ))
     }
 
@@ -88,6 +105,11 @@ impl AgentSpec {
             AgentSpec::Calling => "calling".to_string(),
             AgentSpec::Random(s) => format!("random:{s}"),
             AgentSpec::Human => "human".to_string(),
+            AgentSpec::Nit(s) => format!("nit:{s}"),
+            AgentSpec::Tag(s) => format!("tag:{s}"),
+            AgentSpec::Lag(s) => format!("lag:{s}"),
+            AgentSpec::Maniac(s) => format!("maniac:{s}"),
+            AgentSpec::TiltProne(s) => format!("tilt:{s}"),
         }
     }
 
@@ -96,6 +118,11 @@ impl AgentSpec {
             AgentSpec::Calling => Box::new(CallingStation),
             AgentSpec::Random(seed) => Box::new(RandomAgent::new(*seed)),
             AgentSpec::Human => Box::new(HumanAgent::new()),
+            AgentSpec::Nit(seed) => Box::new(Nit::new(*seed)),
+            AgentSpec::Tag(seed) => Box::new(Tag::new(*seed)),
+            AgentSpec::Lag(seed) => Box::new(Lag::new(*seed)),
+            AgentSpec::Maniac(seed) => Box::new(Maniac::new(*seed)),
+            AgentSpec::TiltProne(seed) => Box::new(TiltProne::new(*seed)),
         }
     }
 

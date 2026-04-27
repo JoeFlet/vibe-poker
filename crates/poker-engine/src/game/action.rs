@@ -13,7 +13,7 @@ pub enum Action {
 }
 
 /// The set of actions that are currently legal for the acting player.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegalActions {
     pub can_check: bool,
     pub can_call: bool,

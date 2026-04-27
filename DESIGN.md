@@ -649,24 +649,64 @@ serving as the schema source of truth.
     `HandResult` block. Ships the first rendering layer; will be reused by
     `poker-client` for live play. `poker_play --log <path>` fans the live
     run through a `TeeSink` so stats and a durable log come from one pass. ✅
-17. **In-house opponent dataset** ← current — drive long `SimRunner` sessions with a
-    diverse bot pool (calling station, maniac, TAG, LAG, nit, tilt-prone,
-    blueprint-mix) and an aggregator over the resulting event logs. Targets:
-    - per-seat **VPIP**, **PFR**, **AF**, **c-bet %**, **fold-to-3bet**,
-      **WTSD** (already have most via `StatsSink`).
-    - **class-conditional** response distributions: how each bot's frequencies
-      shift when an opponent is labelled maniac vs. station vs. nit. Requires
-      running every bot against every other bot and bucketing by opponent
-      class.
-    - **session-windowed** stats over rolling N-hand windows to surface
-      time-correlated drift (e.g., post-loss VPIP inflation). The aggregator
-      reads `FileSink` logs, so any future client/server traffic captured to
-      the same format slots in unchanged.
-    - This is the dog-food dataset; importing external hand histories is a
-      later option, not a prerequisite.
-18. **Exploit layer** — opponent profiling consumer on `EngineEvent` using
-    the stat schema validated in step 17, plus best-response mixing with the
-    MCCFR blueprint. Mixing weight trades exploitation against exploitability.
+17. **In-house opponent dataset** — five-persona bot pool (`Nit`, `Tag`,
+    `Lag`, `Maniac`, `TiltProne`) in [agent/personas.rs](crates/poker-engine/src/agent/personas.rs),
+    each gating actions on a shared `Strength` bucket (preflop class for
+    preflop; best-5-of-7 hand category for postflop). The `dataset` module
+    provides `extract_hand_stats(events, seat_class) -> Vec<HandStats>` —
+    one row per (hand, live seat) tagged with `own_class` and a sorted
+    `opponents_sig`, so rows from different matchups concatenate cleanly.
+    `class_conditional` and `windowed` slice that slab. The
+    `poker_dataset` binary runs a heads-up round-robin over the pool, prints
+    a per-persona summary, the (own × opponent) class-conditional matrix
+    (VPIP / PFR / AF / WTSD / chip EV), and rolling-window time series for
+    each persona; with `--out <dir>` it also dumps the raw `FileSink` logs
+    so every matchup can be replayed in `poker-client`. Future client/server
+    traffic captured to the same `FileSink` format slots in unchanged.
+    Importing external hand histories is a later option, not a prerequisite. ✅
+18. **Exploit layer** — opponent profiling consumer on `EngineEvent`
+    using the stat schema validated in step 17, plus best-response mixing
+    with the MCCFR blueprint. Mixing weight trades exploitation against
+    exploitability. Deferred behind the live client/server work.
 19. **`poker-server` + `poker-client`** — companion crates (see above).
     Server hosts hands; client renders them via the step-16 layer. Bots
     connect via the same `Agent` trait, exercised over the wire.
+    - **19a — server skeleton.** Wire types in
+      `poker_engine::net` (msgpack messages + a sync `[u32 LE len][bytes]`
+      framer matching `FileSink`). New `poker-server` crate with a tokio
+      TCP listener, async wire helpers, and a per-connection session
+      driving the `Hello{username, version}` → `Welcome{player_id, stats}`
+      handshake. A `Registry` persists one `<data_dir>/users/<name>.mp`
+      record per player so reconnects pick up the same `PlayerId` and
+      `LifetimeStats`; an in-memory online set rejects duplicate logins.
+      Heartbeat / Disconnect close the loop. Six TCP integration tests
+      (handshake, protocol mismatch, invalid name, double-login, heartbeat,
+      reconnect-recalls-id) plus five registry unit tests. ✅
+    - **19b — game messages.** `ListTables` /
+      `JoinTable` / `LeaveTable` / `SubmitAction` from client; matching
+      `TableList` / `JoinedTable` / `TableState` / `TableEvent` /
+      `Prompt` / `ActionRejected` from server. Per-table actor task
+      runs hands sequentially: waits for quorum, snapshots seated
+      players, runs `Engine::run_hand` on `spawn_blocking` with one
+      `RemoteAgent` per seat. The agent issues a `Prompt` over the
+      connection's outbound queue and `block_on`s a `oneshot` that
+      `SubmitAction` resolves; missed deadlines fold for the player.
+      A `BroadcastSink` fans events out per-recipient: hole cards
+      ride to their owner only, and `HandEnded` masks all hole cards
+      for non-recipients except at proper showdowns (river dealt with
+      ≥2 contenders). Two TCP integration tests cover fold-through
+      (no leaks) and check/call-to-showdown (both hands revealed). ✅
+    - **19c — live client.** `poker-client` grew a tokio-backed
+      `LiveClient` worker thread bridged to egui via paired mpsc
+      channels. New `LiveApp` egui state machine: Connecting → Lobby
+      (table picker with refresh + buy-in input) → Seated (snapshot
+      view, seat list with stacks, action panel that lights up on
+      `Prompt`). The seated view reuses the step-16 `Snapshot` /
+      `render_snapshot` pipeline, fed event-by-event from inbound
+      `TableEvent`s. Action panel issues `SubmitAction` for
+      fold/check/call/all-in, plus a min/max-bounded raise slider.
+      One in-process smoke test drives the worker through Hello →
+      Welcome → ListTables → TableList against the same `ServerContext`
+      the 19b TCP tests use. ✅
+    - **19d — stat persistence.** Server feeds finished hands into the
+      step-17 aggregator and writes back `LifetimeStats` per `PlayerId`.
