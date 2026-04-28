@@ -7,7 +7,8 @@ The repository is a Cargo workspace:
 | Crate | Role |
 |---|---|
 | [crates/poker-engine](crates/poker-engine/) | Core library (game state, betting, evaluator, sim runner, MCCFR solver) and CLI binaries: `poker_report`, `poker_train`, `poker_play` |
-| [crates/poker-client](crates/poker-client/) | `egui`/`eframe` desktop app — currently the replay viewer; will host the live client |
+| [crates/poker-server](crates/poker-server/) | Async TCP game host — drives `Engine` on `spawn_blocking`, fans events to clients, persists player records |
+| [crates/poker-client](crates/poker-client/) | `egui`/`eframe` desktop app — replay viewer (`--replay`) and live client (`--connect`) |
 
 ## Goals
 
@@ -465,10 +466,128 @@ DESIGN.md           Architecture decisions and step-by-step build plan
 | `poker_train` + `poker_play` CLI loop | ✅ |
 | `egui` replay viewer (`poker-client --replay`) | ✅ |
 | Persona bot pool + dataset aggregator + `poker_dataset` driver | ✅ |
+| `poker-server` TCP host (19a–19b): handshake, table actor, `BroadcastSink` | ✅ |
+| Live `poker-client` (19c): `LiveClient` worker + egui state machine | ✅ |
 | Exploit layer: opponent profiler + best-response mixing | 🔲 Next |
-| `poker-server` + live `poker-client` | 🔲 Planned |
+| Server-side stat persistence (19d): `LifetimeStats` written back per hand | 🔲 Planned |
 
 The full plan with rationale lives in [DESIGN.md](DESIGN.md).
+
+---
+
+## Live server (`poker-server`)
+
+`poker-server` is a fully implemented TCP game host. It drives the synchronous
+engine on `tokio::task::spawn_blocking`, fans `EngineEvent`s to every seated
+player (with hole-card masking), and persists player records across sessions.
+
+### Starting the server
+
+```sh
+# Localhost only (default)
+cargo run -p poker-server
+
+# Accept connections from other machines
+cargo run -p poker-server -- --bind 0.0.0.0:7878
+
+# Custom table configuration
+cargo run -p poker-server -- \
+    --bind 0.0.0.0:9000 \
+    --small-blind 5 \
+    --big-blind 10 \
+    --max-seats 6 \
+    --buy-in 1000 \
+    --data-dir /var/lib/poker
+```
+
+All flags with defaults:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--bind` | `127.0.0.1:7878` | TCP address to listen on |
+| `--data-dir` | `data` | Directory for persistent player records (`users/<name>.mp`) |
+| `--small-blind` | `1` | Small blind for the default table |
+| `--big-blind` | `2` | Big blind for the default table |
+| `--max-seats` | `2` | Seat count for the default table |
+| `--buy-in` | `200` | Default buy-in chips suggested to clients |
+
+### Connecting as a client
+
+```sh
+cargo run -p poker-client -- --connect 127.0.0.1:7878 --username alice
+```
+
+The `egui` live client goes through: **Connecting → Lobby** (table picker with
+refresh and buy-in input) **→ Seated** (snapshot view, seat list, action panel).
+The action panel lights up on a `Prompt` and submits fold / check / call / all-in
+or a min-/max-bounded raise slider.
+
+### Wire protocol
+
+Transport is a raw TCP stream; there is no HTTP or WebSocket layer.
+
+**Frame format** (same as `FileSink` on disk):
+```
+[4-byte u32 LE payload-length][rmp-serde/msgpack payload]
+```
+
+**Protocol version**: `2` (bumped on any backwards-incompatible message change).
+
+**Session flow**:
+
+```
+Client                          Server
+  │  Hello { version, username } │
+  │ ──────────────────────────> │
+  │  Welcome { player_id, stats }│   (or Rejected { reason })
+  │ <────────────────────────── │
+  │                             │
+  │  ListTables                 │
+  │ ──────────────────────────> │
+  │  TableList { tables }       │
+  │ <────────────────────────── │
+  │                             │
+  │  JoinTable { table_id, buy_in }
+  │ ──────────────────────────> │
+  │  JoinedTable / ActionRejected
+  │ <────────────────────────── │
+  │                             │
+  │            [hand plays out] │
+  │  TableEvent { EngineEvent } │  (repeated — hole cards masked per-recipient)
+  │ <────────────────────────── │
+  │  Prompt { legal, deadline } │
+  │ <────────────────────────── │
+  │  SubmitAction { action }    │
+  │ ──────────────────────────> │
+  │                             │
+  │  Disconnect                 │
+  │ ──────────────────────────> │
+  │  Goodbye { reason }         │
+  │ <────────────────────────── │
+```
+
+**Username rules**: 3–24 chars, ASCII alphanumeric / `_` / `-` / `.`, must start
+with a letter or digit. The same validation function is exposed from
+`poker_engine::net::protocol::is_valid_username` so clients can pre-validate.
+
+**Reconnect**: a player who reconnects with the same username gets the same stable
+`PlayerId` and `LifetimeStats` from the persistent registry.
+
+**Missed deadline**: if a seated player does not reply to a `Prompt` within
+`deadline_ms`, the server auto-folds that seat and the hand continues.
+
+**Privacy**: `HoleCardsDealt` events are delivered only to their owner.
+`HandEnded` masks all hole cards for non-recipients except at proper showdowns
+(river dealt with ≥ 2 non-folded contenders).
+
+### Logging
+
+The server logs at `info` level by default, `debug` for the `poker_server`
+module. Override with `RUST_LOG`:
+
+```sh
+RUST_LOG=debug cargo run -p poker-server
+```
 
 ---
 
