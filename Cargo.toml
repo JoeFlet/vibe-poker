@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/poker-engine",
+    "crates/poker-trainer",
     "crates/poker-client",
     "crates/poker-server",
 ]

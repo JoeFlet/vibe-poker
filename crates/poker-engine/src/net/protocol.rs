@@ -6,11 +6,16 @@
 //! by [`super::frame`]; whether they ride TCP, WebSockets, or an
 //! in-process channel is the caller's choice.
 //!
-//! For now the protocol covers only the **handshake layer** — enough
-//! for a client to identify itself with a username, receive a stable
-//! `PlayerId`, and let the server attach prior lifetime statistics.
-//! Game-bearing messages (table list, sit/leave, action prompts, event
-//! broadcasts) will land in a follow-up step.
+//! Handshake (PROTOCOL_VERSION 3): the first message on a fresh
+//! connection is either [`ClientMessage::Register`] (account creation)
+//! or [`ClientMessage::Authenticate`] (existing account, by password
+//! or session key). Both succeed with [`ServerMessage::Welcome`]
+//! carrying a `session_key` that survives reconnects until either the
+//! user authenticates from a fresh device (which revokes prior
+//! sessions) or the server explicitly revokes it.
+//!
+//! Email is server-side state only; broadcasts (`SeatInfo`, etc.) ship
+//! username only.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +24,7 @@ use crate::game::{Action, EngineEvent, HandId, LegalActions, SeatIndex};
 /// Bumped on any backwards-incompatible change to message shapes.
 /// The server sends its version in `Welcome` / `Rejected`; clients
 /// SHOULD refuse to proceed against a mismatched major version.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Stable identifier for a poker table. Allocated by the server.
 pub type TableId = u32;
@@ -66,14 +71,42 @@ pub struct LifetimeStats {
     pub chip_delta: i64,
 }
 
+/// One half of [`ClientMessage::Authenticate`]: how the client is
+/// proving its identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AuthMode {
+    /// Email or username + plaintext password. The server hashes with
+    /// Argon2id and compares against `user_password.password_hash`.
+    Password { identifier: String, password: String },
+    /// Reuse a `session_key` previously issued by a `Welcome`. Valid
+    /// until the user authenticates from another device or the server
+    /// revokes it.
+    Session { key: String },
+}
+
 /// Messages a client sends to the server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMessage {
-    /// First message on a fresh connection. The server replies with
-    /// either [`ServerMessage::Welcome`] or [`ServerMessage::Rejected`].
-    Hello {
+    /// Create a new account. Email and username must both be unused.
+    /// On success the server replies with [`ServerMessage::Welcome`]
+    /// carrying a fresh `session_key`. On failure
+    /// [`ServerMessage::Rejected`].
+    Register {
         protocol_version: u32,
+        email: String,
         username: String,
+        password: String,
+        device_label: Option<String>,
+    },
+
+    /// Authenticate an existing account by password or by a previously
+    /// issued session key. On success the server replies with
+    /// [`ServerMessage::Welcome`]. Issuing a new password-mode session
+    /// revokes any prior session for the same user.
+    Authenticate {
+        protocol_version: u32,
+        mode: AuthMode,
+        device_label: Option<String>,
     },
 
     /// Ask the server for the current table list. Server replies with
@@ -112,12 +145,15 @@ pub enum ClientMessage {
 /// pattern matching for assertions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
-    /// Handshake accepted. Carries the player's stable id and any
-    /// stats accumulated in prior sessions.
+    /// Handshake accepted. Carries the player's stable id, the session
+    /// key the client should retain for subsequent
+    /// [`AuthMode::Session`] reconnects, and any stats accumulated in
+    /// prior sessions.
     Welcome {
         protocol_version: u32,
         player_id: PlayerId,
         username: String,
+        session_key: String,
         stats: LifetimeStats,
     },
     /// Handshake refused. `reason` is a short, human-readable string.
@@ -177,14 +213,22 @@ pub enum ServerMessage {
     },
 }
 
-/// Reasons the server may reject a `Hello`. Stringified into
-/// `ServerMessage::Rejected.reason` so the wire format stays simple,
-/// but kept as an enum here for callers that want to match.
+/// Reasons the server may reject `Register` / `Authenticate`.
+/// Stringified into `ServerMessage::Rejected.reason` so the wire
+/// format stays simple, but kept as an enum here for callers that
+/// want to match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     ProtocolMismatch,
     InvalidUsername,
-    AlreadyConnected,
+    InvalidEmail,
+    InvalidPassword,
+    UsernameInUse,
+    EmailInUse,
+    BadCredentials,
+    SessionRevoked,
+    UnknownSession,
+    InternalError,
 }
 
 impl RejectReason {
@@ -192,7 +236,14 @@ impl RejectReason {
         match self {
             Self::ProtocolMismatch => "protocol version mismatch",
             Self::InvalidUsername => "invalid username",
-            Self::AlreadyConnected => "username already connected",
+            Self::InvalidEmail => "invalid email",
+            Self::InvalidPassword => "invalid password",
+            Self::UsernameInUse => "username already in use",
+            Self::EmailInUse => "email already in use",
+            Self::BadCredentials => "bad credentials",
+            Self::SessionRevoked => "session revoked",
+            Self::UnknownSession => "unknown session",
+            Self::InternalError => "internal error",
         }
     }
 }
@@ -217,6 +268,39 @@ pub fn is_valid_username(name: &str) -> bool {
     })
 }
 
+/// Lightweight email shape check — non-empty local part, a single `@`,
+/// a domain with at least one `.`. We deliberately don't pretend to
+/// implement RFC-5321; this catches typos without forbidding any sane
+/// address. Length cap matches the SMTP envelope limit (254).
+pub fn is_valid_email(email: &str) -> bool {
+    if !(3..=254).contains(&email.len()) {
+        return false;
+    }
+    let Some(at) = email.find('@') else { return false };
+    if email.matches('@').count() != 1 {
+        return false;
+    }
+    let (local, domain_part) = email.split_at(at);
+    let domain = &domain_part[1..];
+    if local.is_empty() || domain.is_empty() {
+        return false;
+    }
+    if !domain.contains('.') {
+        return false;
+    }
+    !email
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Password length window. The server hashes the password with Argon2id
+/// before storage, but enforces a minimum length here so trivially weak
+/// passwords are caught at the boundary and clients can pre-check.
+pub fn is_valid_password(password: &str) -> bool {
+    let len = password.len();
+    (8..=128).contains(&len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,27 +318,52 @@ mod tests {
     }
 
     #[test]
+    fn email_validation() {
+        assert!(is_valid_email("alice@example.com"));
+        assert!(is_valid_email("a@b.co"));
+        assert!(!is_valid_email("plain-text"));            // no @
+        assert!(!is_valid_email("a@b"));                   // no dot in domain
+        assert!(!is_valid_email("@example.com"));          // empty local
+        assert!(!is_valid_email("alice@"));                // empty domain
+        assert!(!is_valid_email("a@@b.co"));               // two ats
+        assert!(!is_valid_email("a b@example.com"));       // whitespace
+    }
+
+    #[test]
+    fn password_validation() {
+        assert!(is_valid_password("hunter2hunter"));
+        assert!(!is_valid_password("short"));              // < 8
+        assert!(!is_valid_password(&"x".repeat(129)));     // > 128
+    }
+
+    #[test]
     fn message_roundtrip() {
-        let hello = ClientMessage::Hello {
+        let auth = ClientMessage::Authenticate {
             protocol_version: PROTOCOL_VERSION,
-            username: "alice".into(),
+            mode: AuthMode::Password {
+                identifier: "alice".into(),
+                password: "hunter2hunter".into(),
+            },
+            device_label: Some("test".into()),
         };
-        let bytes = rmp_serde::to_vec(&hello).unwrap();
+        let bytes = rmp_serde::to_vec(&auth).unwrap();
         let back: ClientMessage = rmp_serde::from_slice(&bytes).unwrap();
-        assert_eq!(hello, back);
+        assert_eq!(auth, back);
 
         let welcome = ServerMessage::Welcome {
             protocol_version: PROTOCOL_VERSION,
             player_id: 42,
             username: "alice".into(),
+            session_key: "abc123".into(),
             stats: LifetimeStats { hands: 17, ..Default::default() },
         };
         let bytes = rmp_serde::to_vec(&welcome).unwrap();
         let back: ServerMessage = rmp_serde::from_slice(&bytes).unwrap();
         match back {
-            ServerMessage::Welcome { player_id, username, stats, .. } => {
+            ServerMessage::Welcome { player_id, username, session_key, stats, .. } => {
                 assert_eq!(player_id, 42);
                 assert_eq!(username, "alice");
+                assert_eq!(session_key, "abc123");
                 assert_eq!(stats.hands, 17);
             }
             other => panic!("expected Welcome, got {other:?}"),

@@ -5,14 +5,19 @@
 //! exchange that lets the synchronous engine drive a remote player.
 
 pub mod connection;
+pub mod db;
+pub mod limits;
 pub mod registry;
 pub mod remote_agent;
 pub mod session;
 pub mod table;
 pub mod wire;
 
-pub use connection::Connection;
-pub use registry::{PlayerRecord, Registry, RegistryError};
-pub use session::{handle_connection, run_session, ServerContext, SessionError};
+pub use connection::{Connection, SeatLink};
+pub use limits::{ConnectionLimits, TokenBucket};
+pub use registry::{
+    AuthSuccess, HandRecord, HandSeatRecord, PlayerRecord, Registry, RegistryError,
+};
+pub use session::{ServerContext, SessionError, handle_connection, run_session};
 pub use table::{run_table, shutdown_all, Table, TableConfig, TableManager};
 pub use wire::{read_message, write_message, WireError};

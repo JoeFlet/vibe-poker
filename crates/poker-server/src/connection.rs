@@ -9,12 +9,13 @@
 //! response should land."
 
 use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
-use poker_engine::game::{Action, HandId, LegalActions};
+use poker_engine::game::{Action, HandId, LegalActions, SeatIndex};
 use poker_engine::net::protocol::{PlayerId, ServerMessage, TableId};
 
 use crate::wire::write_message;
@@ -28,6 +29,10 @@ const OUTBOUND_CAPACITY: usize = 256;
 pub struct PendingAction {
     pub table_id: TableId,
     pub hand_id: HandId,
+    /// Engine-side seat index this prompt was issued for. Recorded so
+    /// a reconnect can re-send the same `Prompt` to the new socket
+    /// (step 22c) without rebuilding it from scratch.
+    pub seat: SeatIndex,
     pub legal: LegalActions,
     pub responder: oneshot::Sender<Action>,
 }
@@ -36,6 +41,10 @@ pub struct PendingAction {
 pub struct Connection {
     pub player_id: PlayerId,
     pub username: String,
+    /// Identifies the auth session this connection backs. Used by
+    /// reconnect-detection so the table can tell two distinct logins
+    /// for the same player apart.
+    pub session_id: i64,
     /// Send a message to the client. Cheap to clone.
     pub out_tx: mpsc::Sender<ServerMessage>,
     /// Set by `RemoteAgent::act` before it issues a `Prompt`; taken
@@ -46,12 +55,17 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(player_id: PlayerId, username: String) -> (Self, mpsc::Receiver<ServerMessage>) {
+    pub fn new(
+        player_id: PlayerId,
+        username: String,
+        session_id: i64,
+    ) -> (Self, mpsc::Receiver<ServerMessage>) {
         let (out_tx, out_rx) = mpsc::channel(OUTBOUND_CAPACITY);
         (
             Self {
                 player_id,
                 username,
+                session_id,
                 out_tx,
                 pending: StdMutex::new(None),
             },
@@ -117,5 +131,46 @@ pub async fn writer_task<W: AsyncWrite + Unpin>(
             warn!(error = %e, "writer task: send failed");
             break;
         }
+    }
+}
+
+/// Stable handle to a seat's "current connection." The table, the
+/// per-hand snapshot, the [`crate::remote_agent::RemoteAgent`], and
+/// the [`crate::table::BroadcastSink`] all hold `Arc<SeatLink>`s
+/// rather than `Arc<Connection>`s directly. When the player reconnects
+/// from a new device the link is swapped in place, so any subsequent
+/// outbound traffic and any not-yet-resolved `PendingAction` migrate
+/// to the new socket without restarting the hand. See step 22c in
+/// `DESIGN.md`.
+pub struct SeatLink {
+    inner: StdRwLock<Arc<Connection>>,
+}
+
+impl SeatLink {
+    pub fn new(conn: Arc<Connection>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: StdRwLock::new(conn),
+        })
+    }
+
+    /// Snapshot the connection currently bound to this seat.
+    pub fn current(&self) -> Arc<Connection> {
+        Arc::clone(&self.inner.read().expect("seat link poisoned"))
+    }
+
+    /// Atomically swap the bound connection. Returns the previous
+    /// `Arc<Connection>` so the caller can finish any handover
+    /// bookkeeping (e.g. clear its `pending` slot).
+    pub fn replace(&self, new: Arc<Connection>) -> Arc<Connection> {
+        let mut guard = self.inner.write().expect("seat link poisoned");
+        std::mem::replace(&mut *guard, new)
+    }
+
+    pub fn player_id(&self) -> PlayerId {
+        self.current().player_id
+    }
+
+    pub fn session_id(&self) -> i64 {
+        self.current().session_id
     }
 }

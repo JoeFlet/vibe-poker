@@ -8,6 +8,12 @@
 //! I/O is intentionally absent from this module: callers wire `frame::encode`
 //! / `frame::decode` to whatever transport (tokio, std, sync, async) they
 //! prefer, keeping `poker-engine` free of network dependencies.
+//!
+//! See `crates/poker-engine/src/net/PROTOCOL.md` for the long-form
+//! functional spec — framing, handshake, every message variant,
+//! ordering guarantees, error model, and reconnect procedure —
+//! sufficient to build a non-Rust client without reading server
+//! source.
 
 pub mod frame;
 pub mod protocol;

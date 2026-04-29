@@ -1,0 +1,17 @@
+[package]
+name = "poker-trainer"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "poker_trainer"
+path = "src/lib.rs"
+
+[dependencies]
+poker_engine = { path = "../poker-engine" }
+rand = { version = "0.8", features = ["small_rng"] }
+smallvec = { version = "1", features = ["serde"] }
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }

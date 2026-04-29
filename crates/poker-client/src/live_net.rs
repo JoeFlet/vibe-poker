@@ -18,7 +18,41 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use poker_engine::net::frame::{self, FrameError, LENGTH_PREFIX_BYTES};
-use poker_engine::net::protocol::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
+use poker_engine::net::protocol::{AuthMode, ClientMessage, ServerMessage, PROTOCOL_VERSION};
+
+/// First message the client sends — either a fresh registration or an
+/// authentication of an existing account.
+#[derive(Clone, Debug)]
+pub enum LoginRequest {
+    Register {
+        email: String,
+        username: String,
+        password: String,
+    },
+    Password {
+        identifier: String,
+        password: String,
+    },
+}
+
+impl LoginRequest {
+    fn into_message(self) -> ClientMessage {
+        match self {
+            LoginRequest::Register { email, username, password } => ClientMessage::Register {
+                protocol_version: PROTOCOL_VERSION,
+                email,
+                username,
+                password,
+                device_label: None,
+            },
+            LoginRequest::Password { identifier, password } => ClientMessage::Authenticate {
+                protocol_version: PROTOCOL_VERSION,
+                mode: AuthMode::Password { identifier, password },
+                device_label: None,
+            },
+        }
+    }
+}
 
 /// Size of the read buffer used when pulling one msgpack frame off
 /// the wire. Heap-allocated per-frame so a stray oversized message
@@ -44,10 +78,10 @@ pub struct LiveClient {
 }
 
 impl LiveClient {
-    /// Spawn a worker thread that connects to `addr`, sends a
-    /// `Hello` with `username`, and shuttles messages until either
-    /// the gui drops the client or the socket closes.
-    pub fn connect(addr: String, username: String) -> Self {
+    /// Spawn a worker thread that connects to `addr`, sends the
+    /// requested handshake, and shuttles messages until either the
+    /// gui drops the client or the socket closes.
+    pub fn connect(addr: String, login: LoginRequest) -> Self {
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         let (in_tx, in_rx) = mpsc::unbounded_channel();
 
@@ -58,7 +92,7 @@ impl LiveClient {
                     .enable_all()
                     .build()
                     .expect("build tokio runtime");
-                rt.block_on(run(addr, username, out_rx, in_tx));
+                rt.block_on(run(addr, login, out_rx, in_tx));
             })
             .expect("spawn network worker");
 
@@ -94,7 +128,7 @@ impl Drop for LiveClient {
 
 async fn run(
     addr: String,
-    username: String,
+    login: LoginRequest,
     mut out_rx: mpsc::UnboundedReceiver<ClientMessage>,
     in_tx: mpsc::UnboundedSender<LiveEvent>,
 ) {
@@ -115,13 +149,9 @@ async fn run(
     }
     let (mut read, mut write) = stream.into_split();
 
-    // Send Hello.
-    let hello = ClientMessage::Hello {
-        protocol_version: PROTOCOL_VERSION,
-        username,
-    };
-    if let Err(e) = send_one(&mut write, &hello).await {
-        let _ = in_tx.send(LiveEvent::Disconnected(format!("send Hello: {e}")));
+    let handshake = login.into_message();
+    if let Err(e) = send_one(&mut write, &handshake).await {
+        let _ = in_tx.send(LiveEvent::Disconnected(format!("send handshake: {e}")));
         return;
     }
 
@@ -238,8 +268,8 @@ mod tests {
             cfg.max_seats as usize,
         );
         let tables = TableManager::new();
-        tables.install(Table::new(7, cfg), rules).await;
-        let ctx = ServerContext { registry, tables };
+        tables.install(Table::new(7, cfg), rules, Arc::clone(&registry)).await;
+        let ctx = ServerContext { registry, tables, limits: Default::default() };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -254,7 +284,12 @@ mod tests {
             }
         });
 
-        let mut client = LiveClient::connect(addr.to_string(), "alice".into());
+        let login = LoginRequest::Register {
+            email: "alice@example.com".into(),
+            username: "alice".into(),
+            password: "hunter2hunter".into(),
+        };
+        let mut client = LiveClient::connect(addr.to_string(), login);
 
         // Wait up to 2s for Welcome.
         let mut welcomed = false;

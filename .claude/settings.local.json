@@ -6,7 +6,8 @@
       "Bash(cargo bench *)",
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(xargs grep *)"
+      "Bash(xargs grep *)",
+      "Bash(cargo run *)"
     ]
   }
 }

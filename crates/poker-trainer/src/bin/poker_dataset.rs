@@ -22,7 +22,7 @@ use clap::Parser;
 use poker_engine::agent::personas::{Lag, Maniac, Nit, Tag, TiltProne};
 use poker_engine::agent::Agent;
 use poker_engine::core::RsPokerEvaluator;
-use poker_engine::dataset::{
+use poker_trainer::dataset::{
     class_conditional, extract_hand_stats, windowed, HandStats, StatRollup,
 };
 use poker_engine::game::{BettingRules, Engine, EventSink, FileSink, VecSink};

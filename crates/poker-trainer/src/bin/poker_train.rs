@@ -11,7 +11,7 @@ use clap::Parser;
 
 use poker_engine::core::RsPokerEvaluator;
 use poker_engine::game::{BettingRules, Engine, SeatIndex};
-use poker_engine::solver::{save_blueprint, MccfrTrainer};
+use poker_trainer::solver::{save_blueprint, MccfrTrainer};
 
 #[derive(Parser, Debug)]
 #[command(

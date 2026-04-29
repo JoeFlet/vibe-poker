@@ -20,7 +20,7 @@ use tokio::time::timeout;
 
 use poker_engine::game::{Action, BettingRules, EngineEvent};
 use poker_engine::net::protocol::{
-    ClientMessage, SeatInfo, ServerMessage, PROTOCOL_VERSION,
+    ClientMessage, PROTOCOL_VERSION, SeatInfo, ServerMessage,
 };
 use poker_server::{
     handle_connection, read_message, write_message, Registry, ServerContext, Table, TableConfig,
@@ -45,8 +45,8 @@ async fn spawn_server() -> (std::net::SocketAddr, tempfile::TempDir) {
     };
     let rules = BettingRules::no_limit_holdem(cfg.small_blind, cfg.big_blind, cfg.max_seats as usize);
     let tables = TableManager::new();
-    tables.install(Table::new(1, cfg), rules).await;
-    let ctx = ServerContext { registry, tables };
+    tables.install(Table::new(1, cfg), rules, Arc::clone(&registry)).await;
+    let ctx = ServerContext { registry, tables, limits: Default::default() };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -63,29 +63,25 @@ async fn spawn_server() -> (std::net::SocketAddr, tempfile::TempDir) {
     (addr, dir)
 }
 
-/// Connect, log in, return the socket and the welcome message.
+/// Connect, register a fresh user, return the socket and the welcome message.
 async fn connect_and_login(
     addr: std::net::SocketAddr,
     username: &str,
 ) -> (TcpStream, ServerMessage) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
+    let email = format!("{username}@example.com");
+    let register = ClientMessage::Register {
+        protocol_version: PROTOCOL_VERSION,
+        email,
+        username: username.into(),
+        password: "hunter2hunter".into(),
+        device_label: None,
+    };
     {
         let (mut read, mut write) = stream.split();
-        write_message(
-            &mut write,
-            &ClientMessage::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                username: username.into(),
-            },
-        )
-        .await
-        .unwrap();
+        write_message(&mut write, &register).await.unwrap();
         let welcome: ServerMessage = timeout(T, read_message(&mut read)).await.unwrap().unwrap();
-        return (
-            // stream is borrowed by `split`; rebuild via the let reborrow below
-            stream_unsplit(stream),
-            welcome,
-        );
+        return (stream_unsplit(stream), welcome);
     }
 }
 
@@ -186,12 +182,15 @@ async fn check_call_session(addr: std::net::SocketAddr, username: &'static str) 
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let (mut read, mut write) = stream.split();
 
-    // Hello / Welcome.
+    // Register / Welcome.
     write_message(
         &mut write,
-        &ClientMessage::Hello {
+        &ClientMessage::Register {
             protocol_version: PROTOCOL_VERSION,
+            email: format!("{username}@example.com"),
             username: username.into(),
+            password: "hunter2hunter".into(),
+            device_label: None,
         },
     )
     .await

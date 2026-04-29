@@ -19,11 +19,14 @@ use poker_engine::core::{Card, RsPokerEvaluator};
 use poker_engine::game::{
     BettingRules, Engine, EngineEvent, EventSink, HandId, HandResult, SeatIndex, SeatOutcome,
 };
+use poker_engine::net::frame;
 use poker_engine::net::protocol::{
     PlayerId, SeatInfo, ServerMessage, TableId, TableInfo,
 };
 
-use crate::connection::Connection;
+use crate::registry::{HandSeatRecord, Registry};
+
+use crate::connection::{Connection, SeatLink};
 use crate::remote_agent::RemoteAgent;
 
 /// Static configuration for a table.
@@ -63,7 +66,9 @@ struct Seat {
     player_id: PlayerId,
     username: String,
     stack: u32,
-    conn: Arc<Connection>,
+    /// Indirection so a reconnect (step 22c) can swap the bound
+    /// connection without rebuilding the seat or the in-flight hand.
+    link: Arc<SeatLink>,
     /// True if the player asked to leave; honored at the next hand boundary.
     leave_pending: bool,
 }
@@ -152,12 +157,75 @@ impl Table {
             player_id: conn.player_id,
             username: conn.username.clone(),
             stack: buy_in,
-            conn,
+            link: SeatLink::new(conn),
             leave_pending: false,
         });
         drop(inner);
         self.notify.notify_one();
         Ok(seat_idx)
+    }
+
+    /// Step 22c — splice a fresh connection into an already-seated
+    /// player without disturbing an in-flight hand.
+    ///
+    /// If `new_conn.player_id` matches an existing seat the link is
+    /// swapped in place. Any [`PendingAction`] that was waiting on the
+    /// previous connection is migrated to `new_conn` and a fresh
+    /// `Prompt` is pushed to the new socket so the player can answer
+    /// it. Returns `Some(seat_idx)` on success, `None` if the player
+    /// is not seated at this table.
+    ///
+    /// [`PendingAction`]: crate::connection::PendingAction
+    pub async fn reconnect_player(&self, new_conn: Arc<Connection>) -> Option<SeatIndex> {
+        let inner = self.state.lock().await;
+        let mut found: Option<(SeatIndex, Arc<SeatLink>)> = None;
+        for (idx, slot) in inner.seats.iter().enumerate() {
+            if let Some(seat) = slot {
+                if seat.player_id == new_conn.player_id {
+                    found = Some((idx, Arc::clone(&seat.link)));
+                    break;
+                }
+            }
+        }
+        let seats_snapshot = seat_infos_locked(&inner);
+        drop(inner);
+        let (idx, link) = found?;
+
+        // Tell the new client where they are, mirroring the JoinedTable
+        // they would have seen on a fresh `JoinTable`. This goes out
+        // before any in-hand frames so the UI knows its seat.
+        new_conn.try_send(ServerMessage::JoinedTable {
+            table_id: self.id,
+            seat: idx,
+            seats: seats_snapshot,
+        });
+
+        let old = link.current();
+        // Lift any in-flight prompt off the old connection so the
+        // engine's `block_on` keeps waiting on the same `oneshot` and
+        // the new socket can resolve it.
+        let migrated = old
+            .pending
+            .lock()
+            .expect("pending mutex poisoned")
+            .take();
+        // Capture the prompt context before we move the struct, so we
+        // can re-issue the matching Prompt over the new socket.
+        let reprompt = migrated.as_ref().map(|p| (p.table_id, p.hand_id, p.seat, p.legal));
+        link.replace(Arc::clone(&new_conn));
+        if let Some(pending) = migrated {
+            *new_conn.pending.lock().expect("pending mutex poisoned") = Some(pending);
+        }
+        if let Some((table_id, hand_id, seat, legal)) = reprompt {
+            new_conn.try_send(ServerMessage::Prompt {
+                table_id,
+                hand_id,
+                seat,
+                legal,
+                deadline_ms: self.config.action_deadline.as_millis() as u32,
+            });
+        }
+        Some(idx)
     }
 
     /// Push a fresh `TableState` to every seated player except the
@@ -166,16 +234,16 @@ impl Table {
         let inner = self.state.lock().await;
         let snapshot = seat_infos_locked(&inner);
         let button = inner.button;
-        let conns: Vec<_> = inner
+        let links: Vec<_> = inner
             .seats
             .iter()
             .filter_map(|s| s.as_ref())
             .filter(|s| except.map_or(true, |id| s.player_id != id))
-            .map(|s| Arc::clone(&s.conn))
+            .map(|s| Arc::clone(&s.link))
             .collect();
         drop(inner);
-        for conn in conns {
-            conn.try_send(ServerMessage::TableState {
+        for link in links {
+            link.current().try_send(ServerMessage::TableState {
                 table_id: self.id,
                 seats: snapshot.clone(),
                 button,
@@ -207,13 +275,25 @@ impl Table {
 
     /// Drop a connection from any seat it holds. Used when a session
     /// closes without a graceful `LeaveTable`.
-    pub async fn force_leave(&self, player_id: PlayerId) {
+    ///
+    /// Skips seats whose [`SeatLink`] no longer points at the given
+    /// `session_id` — that means a newer session has taken the seat
+    /// over (step 22c) and the OLD session's cleanup must not vacate
+    /// it. Pass `None` to vacate regardless of the current owner
+    /// (e.g. a `LeaveTable` from a still-bound session).
+    pub async fn force_leave(&self, player_id: PlayerId, session_id: Option<i64>) {
         let mut inner = self.state.lock().await;
         let mut changed = false;
         let hand_in_progress = inner.hand_in_progress;
         for slot in inner.seats.iter_mut() {
             if let Some(seat) = slot {
                 if seat.player_id == player_id {
+                    if let Some(sid) = session_id {
+                        if seat.link.session_id() != sid {
+                            // A newer session already owns this seat.
+                            break;
+                        }
+                    }
                     if hand_in_progress {
                         seat.leave_pending = true;
                     } else {
@@ -253,17 +333,17 @@ fn seat_infos_locked(inner: &TableInner) -> Vec<SeatInfo> {
         .collect()
 }
 
-fn collect_connections(inner: &TableInner) -> Vec<Arc<Connection>> {
+fn collect_links(inner: &TableInner) -> Vec<Arc<SeatLink>> {
     inner
         .seats
         .iter()
-        .filter_map(|s| s.as_ref().map(|s| Arc::clone(&s.conn)))
+        .filter_map(|s| s.as_ref().map(|s| Arc::clone(&s.link)))
         .collect()
 }
 
 // ─── Game loop ───────────────────────────────────────────────────────────────
 
-pub async fn run_table(table: Arc<Table>, rules: BettingRules) {
+pub async fn run_table(table: Arc<Table>, rules: BettingRules, registry: Arc<Registry>) {
     info!(table_id = table.id, name = %table.config.name, "table actor started");
     loop {
         // Wait for a hand-startable state.
@@ -292,11 +372,62 @@ pub async fn run_table(table: Arc<Table>, rules: BettingRules) {
             "starting hand",
         );
 
-        let result = run_one_hand(&table, &rules, snapshot, deck_seed).await;
+        let player_ids: Vec<PlayerId> =
+            snapshot.players.iter().map(|p| p.link.player_id()).collect();
+        let started_at = unix_now();
+        let (result, log) = run_one_hand(&table, &rules, snapshot, deck_seed).await;
+        let ended_at = unix_now();
         apply_hand_result(&table, &result).await;
+        persist_hand(&registry, &table, started_at, ended_at, log, &result, &player_ids)
+            .await;
 
         // Pause briefly so clients can render the result.
         tokio::time::sleep(table.config.between_hands).await;
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+async fn persist_hand(
+    registry: &Arc<Registry>,
+    table: &Arc<Table>,
+    started_at: i64,
+    ended_at: i64,
+    log: Vec<u8>,
+    result: &HandResult,
+    player_ids: &[PlayerId],
+) {
+    // The HandResult's seat indices have been remapped to the table's
+    // own seat layout, but the order of `result.seats` still matches
+    // the engine-side player list — so the parallel `player_ids` lines
+    // up by position.
+    let seats: Vec<HandSeatRecord> = result
+        .seats
+        .iter()
+        .enumerate()
+        .map(|(engine_seat, outcome)| HandSeatRecord {
+            seat: outcome.seat,
+            player_id: player_ids.get(engine_seat).copied(),
+            chip_delta: outcome.chip_delta,
+            sat_out: outcome.sat_out,
+        })
+        .collect();
+
+    if let Err(e) = registry
+        .record_hand(table.id, started_at, ended_at, log, &seats)
+        .await
+    {
+        warn!(
+            table_id = table.id,
+            hand_id = result.hand_id,
+            error = %e,
+            "failed to persist hand",
+        );
     }
 }
 
@@ -334,7 +465,7 @@ struct RunningSnapshot {
 struct SnapshotPlayer {
     table_seat: SeatIndex,
     stack: u32,
-    conn: Arc<Connection>,
+    link: Arc<SeatLink>,
 }
 
 async fn take_running_snapshot(table: &Arc<Table>) -> RunningSnapshot {
@@ -354,7 +485,7 @@ async fn take_running_snapshot(table: &Arc<Table>) -> RunningSnapshot {
             players.push(SnapshotPlayer {
                 table_seat: idx,
                 stack: seat.stack,
-                conn: Arc::clone(&seat.conn),
+                link: Arc::clone(&seat.link),
             });
         }
     }
@@ -376,9 +507,9 @@ async fn run_one_hand(
     rules: &BettingRules,
     snapshot: RunningSnapshot,
     deck_seed: u64,
-) -> HandResult {
+) -> (HandResult, Vec<u8>) {
     let stacks: Vec<u32> = snapshot.players.iter().map(|p| p.stack).collect();
-    let conns: Vec<Arc<Connection>> = snapshot.players.iter().map(|p| Arc::clone(&p.conn)).collect();
+    let links: Vec<Arc<SeatLink>> = snapshot.players.iter().map(|p| Arc::clone(&p.link)).collect();
     let table_seats: Vec<SeatIndex> = snapshot.players.iter().map(|p| p.table_seat).collect();
 
     let runtime = Handle::current();
@@ -386,22 +517,22 @@ async fn run_one_hand(
     let hand_id = snapshot.hand_id;
     let deadline = table.config.action_deadline;
 
-    let mut agents: Vec<Box<dyn Agent>> = conns
+    let mut agents: Vec<Box<dyn Agent>> = links
         .iter()
-        .map(|c| -> Box<dyn Agent> {
-            Box::new(RemoteAgent::new(Arc::clone(c), table_id, deadline, runtime.clone()))
+        .map(|l| -> Box<dyn Agent> {
+            Box::new(RemoteAgent::new(Arc::clone(l), table_id, deadline, runtime.clone()))
         })
         .collect();
 
     let rules = rules.clone();
     let dealer = snapshot.dealer;
     let stacks_for_blocking = stacks.clone();
-    let conns_for_blocking = conns.clone();
+    let links_for_blocking = links.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let outcome = tokio::task::spawn_blocking(move || {
         let engine = Engine::new(rules, RsPokerEvaluator);
-        let mut sink = BroadcastSink::new(table_id, conns_for_blocking);
-        engine.run_hand(
+        let mut sink = BroadcastSink::new(table_id, links_for_blocking);
+        let result = engine.run_hand(
             hand_id,
             deck_seed,
             &stacks_for_blocking,
@@ -409,15 +540,16 @@ async fn run_one_hand(
             None,
             &mut agents,
             &mut sink,
-        )
+        );
+        (result, sink.into_log())
     })
     .await;
 
-    match result {
-        Ok(r) => r_with_table_seats(r, &table_seats),
+    match outcome {
+        Ok((r, log)) => (r_with_table_seats(r, &table_seats), log),
         Err(e) => {
             warn!(table_id, hand_id, error = %e, "hand task panicked");
-            HandResult { hand_id, board: vec![], seats: vec![] }
+            (HandResult { hand_id, board: vec![], seats: vec![] }, Vec::new())
         }
     }
 }
@@ -465,11 +597,11 @@ async fn apply_hand_result(table: &Arc<Table>, result: &HandResult) {
 
     let snapshot = seat_infos_locked(&inner);
     let button = inner.button;
-    let conns = collect_connections(&inner);
+    let links = collect_links(&inner);
     drop(inner);
 
-    for conn in conns {
-        conn.try_send(ServerMessage::TableState {
+    for link in links {
+        link.current().try_send(ServerMessage::TableState {
             table_id: table.id,
             seats: snapshot.clone(),
             button,
@@ -504,28 +636,50 @@ fn derive_seed(table_id: TableId, hand_id: HandId) -> u64 {
 /// each player only sees their own — except at showdown, where the
 /// reveal rules are: a non-folded seat reveals its cards iff the
 /// hand reached the river with two or more contenders still in.
+///
+/// Also accumulates the unfiltered event stream as a `FileSink`-
+/// compatible byte log (`[u32 LE length][rmp-serde bytes]` per event)
+/// so the table actor can persist it under `hands.log` and clients can
+/// replay it without re-encoding.
 pub struct BroadcastSink {
     table_id: TableId,
-    /// Engine seat index → connection. The vector is parallel to the
-    /// hand's stacks/agents.
-    conns: Vec<Arc<Connection>>,
+    /// Engine seat index → seat link. Each link resolves to whichever
+    /// connection the seat is currently bound to (handles reconnect).
+    /// The vector is parallel to the hand's stacks/agents.
+    links: Vec<Arc<SeatLink>>,
     folded: HashSet<SeatIndex>,
     board_cards: usize,
+    /// Concatenated `[u32 LE len][msgpack]` frames of every event seen
+    /// this hand, ready to drop into `hands.log`.
+    log: Vec<u8>,
 }
 
 impl BroadcastSink {
-    pub fn new(table_id: TableId, conns: Vec<Arc<Connection>>) -> Self {
+    pub fn new(table_id: TableId, links: Vec<Arc<SeatLink>>) -> Self {
         Self {
             table_id,
-            conns,
+            links,
             folded: HashSet::new(),
             board_cards: 0,
+            log: Vec::new(),
+        }
+    }
+
+    /// Consume the sink and return the accumulated event log.
+    pub fn into_log(self) -> Vec<u8> {
+        self.log
+    }
+
+    fn record(&mut self, event: &EngineEvent) {
+        match frame::encode(event) {
+            Ok(framed) => self.log.extend_from_slice(&framed),
+            Err(e) => warn!(table_id = self.table_id, error = %e, "log encode failed"),
         }
     }
 
     fn broadcast_all(&self, event: EngineEvent) {
-        for conn in &self.conns {
-            conn.try_send(ServerMessage::TableEvent {
+        for link in &self.links {
+            link.current().try_send(ServerMessage::TableEvent {
                 table_id: self.table_id,
                 event: event.clone(),
             });
@@ -533,8 +687,8 @@ impl BroadcastSink {
     }
 
     fn send_to(&self, engine_seat: SeatIndex, event: EngineEvent) {
-        if let Some(conn) = self.conns.get(engine_seat) {
-            conn.try_send(ServerMessage::TableEvent {
+        if let Some(link) = self.links.get(engine_seat) {
+            link.current().try_send(ServerMessage::TableEvent {
                 table_id: self.table_id,
                 event,
             });
@@ -543,7 +697,7 @@ impl BroadcastSink {
 
     fn filtered_hand_end(&self, recipient: Option<SeatIndex>, result: &HandResult) -> HandResult {
         // Showdown rule: ≥2 non-folded seats AND river dealt.
-        let non_folded: Vec<SeatIndex> = (0..self.conns.len())
+        let non_folded: Vec<SeatIndex> = (0..self.links.len())
             .filter(|i| !self.folded.contains(i))
             .collect();
         let showdown = self.board_cards >= 5 && non_folded.len() >= 2;
@@ -562,6 +716,9 @@ impl BroadcastSink {
 
 impl EventSink for BroadcastSink {
     fn on_event(&mut self, event: &EngineEvent) {
+        // The persisted log carries the unfiltered truth so a replay
+        // from `hands.log` matches the engine's own event stream.
+        self.record(event);
         match event {
             EngineEvent::HoleCardsDealt { seat, .. } => {
                 // Only the owning seat sees its hole cards.
@@ -579,9 +736,9 @@ impl EventSink for BroadcastSink {
             }
             EngineEvent::HandEnded { hand_id, result } => {
                 // Per-recipient filtered result.
-                for (engine_seat, conn) in self.conns.iter().enumerate() {
+                for (engine_seat, link) in self.links.iter().enumerate() {
                     let filtered = self.filtered_hand_end(Some(engine_seat), result);
-                    conn.try_send(ServerMessage::TableEvent {
+                    link.current().try_send(ServerMessage::TableEvent {
                         table_id: self.table_id,
                         event: EngineEvent::HandEnded {
                             hand_id: *hand_id,
@@ -629,12 +786,12 @@ impl TableManager {
     }
 
     /// Register an already-constructed table and spawn its actor.
-    pub async fn install(&self, table: Arc<Table>, rules: BettingRules) {
+    pub async fn install(&self, table: Arc<Table>, rules: BettingRules, registry: Arc<Registry>) {
         {
             let mut inner = self.inner.write().await;
             inner.tables.insert(table.id, Arc::clone(&table));
         }
-        tokio::spawn(run_table(table, rules));
+        tokio::spawn(run_table(table, rules, registry));
     }
 
     pub async fn list_infos(&self) -> Vec<TableInfo> {

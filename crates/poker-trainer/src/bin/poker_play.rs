@@ -15,7 +15,7 @@ use poker_engine::agent::Agent;
 use poker_engine::core::RsPokerEvaluator;
 use poker_engine::game::{BettingRules, Engine, EngineEvent, EventSink, FileSink};
 use poker_engine::sim::{SeedMode, SimConfig, SimRunner, StackPolicy};
-use poker_engine::solver::{
+use poker_trainer::solver::{
     load_blueprint, BlueprintStrategy, StrategyAdapter,
 };
 use poker_engine::stats::{print_report, StatsSink};

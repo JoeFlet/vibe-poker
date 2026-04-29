@@ -24,10 +24,10 @@ use poker_engine::agent::{Agent, Observation};
 use poker_engine::game::{Action, EngineEvent, HandId, HandResult};
 use poker_engine::net::protocol::{ServerMessage, TableId};
 
-use crate::connection::{Connection, PendingAction};
+use crate::connection::{PendingAction, SeatLink};
 
 pub struct RemoteAgent {
-    pub conn: Arc<Connection>,
+    pub link: Arc<SeatLink>,
     pub table_id: TableId,
     pub current_hand: HandId,
     pub deadline: Duration,
@@ -36,30 +36,34 @@ pub struct RemoteAgent {
 
 impl RemoteAgent {
     pub fn new(
-        conn: Arc<Connection>,
+        link: Arc<SeatLink>,
         table_id: TableId,
         deadline: Duration,
         runtime: Handle,
     ) -> Self {
-        Self { conn, table_id, current_hand: 0, deadline, runtime }
+        Self { link, table_id, current_hand: 0, deadline, runtime }
     }
 }
 
 impl Agent for RemoteAgent {
     fn act(&mut self, obs: &Observation<'_>) -> Action {
         let (tx, rx) = oneshot::channel();
+        // Resolve the seat's CURRENT connection. After a reconnect
+        // (step 22c) this is the new socket; the previous one is gone.
+        let conn = self.link.current();
         let pending = PendingAction {
             table_id: self.table_id,
             hand_id: self.current_hand,
+            seat: obs.position,
             legal: obs.legal_actions,
             responder: tx,
         };
         {
-            let mut slot = self.conn.pending.lock().expect("pending mutex poisoned");
+            let mut slot = conn.pending.lock().expect("pending mutex poisoned");
             *slot = Some(pending);
         }
 
-        self.conn.try_send(ServerMessage::Prompt {
+        conn.try_send(ServerMessage::Prompt {
             table_id: self.table_id,
             hand_id: self.current_hand,
             seat: obs.position,
@@ -72,19 +76,20 @@ impl Agent for RemoteAgent {
             tokio::time::timeout(deadline, rx).await
         });
 
+        // Re-resolve the link in case a reconnect swapped the
+        // connection underneath us; defensive cleanup of the pending
+        // slot lands on the *current* one.
+        let cleanup = self.link.current();
         match result {
             Ok(Ok(action)) => action,
             Ok(Err(_recv_err)) => {
-                // Sender dropped — usually a disconnect. Clear any
-                // residual pending entry (defensive; cancel_pending
-                // already cleared it on the disconnect path).
-                let _ = self.conn.pending.lock().map(|mut s| s.take());
-                debug!(player_id = self.conn.player_id, "remote agent: response channel dropped, folding");
+                let _ = cleanup.pending.lock().map(|mut s| s.take());
+                debug!(player_id = cleanup.player_id, "remote agent: response channel dropped, folding");
                 Action::Fold
             }
             Err(_elapsed) => {
-                let _ = self.conn.pending.lock().map(|mut s| s.take());
-                debug!(player_id = self.conn.player_id, "remote agent: action deadline elapsed, folding");
+                let _ = cleanup.pending.lock().map(|mut s| s.take());
+                debug!(player_id = cleanup.player_id, "remote agent: action deadline elapsed, folding");
                 Action::Fold
             }
         }

@@ -70,9 +70,12 @@ mod tests {
 
     #[test]
     fn encode_then_decode() {
-        let msg = ClientMessage::Hello {
+        let msg = ClientMessage::Register {
             protocol_version: PROTOCOL_VERSION,
+            email: "alice@example.com".into(),
             username: "alice".into(),
+            password: "hunter2hunter".into(),
+            device_label: None,
         };
         let framed = encode(&msg).unwrap();
         assert!(framed.len() > LENGTH_PREFIX_BYTES);
@@ -93,5 +96,58 @@ mod tests {
             Err(FrameError::TooLarge { .. }) => {}
             other => panic!("expected TooLarge, got {other:?}"),
         }
+    }
+
+    /// Bombard `decode::<ClientMessage>` with arbitrary bytes drawn
+    /// from a deterministic xorshift64 stream. The decoder must
+    /// always return Ok or Err — never panic. Acts as a poor-man's
+    /// fuzzer and a regression guard for future protocol changes.
+    #[test]
+    fn decoder_never_panics_on_random_bytes() {
+        use crate::net::protocol::{ClientMessage, ServerMessage};
+
+        // xorshift64; seed chosen arbitrarily.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for _ in 0..2000 {
+            // Length sampled in [0, 256) so we hit short empties,
+            // mid-sized payloads, and a few "looks like a real frame"
+            // sizes without ballooning the test.
+            let len = (next() as usize) % 256;
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                buf.push(next() as u8);
+            }
+            // Ignore the result — we're proving "no panic", not
+            // "always succeeds".
+            let _ = decode::<ClientMessage>(&buf);
+            let _ = decode::<ServerMessage>(&buf);
+        }
+    }
+
+    /// `parse_length_prefix` rejects any value at or beyond the cap
+    /// without touching the payload — so an attacker can announce a
+    /// 4 GiB frame and the server never allocates the buffer.
+    #[test]
+    fn boundary_prefix_values() {
+        // Exactly at the cap is still fine (a maximally-large frame
+        // is allowed).
+        assert!(parse_length_prefix((MAX_FRAME_BYTES as u32).to_le_bytes()).is_ok());
+        // One past the cap is rejected.
+        assert!(matches!(
+            parse_length_prefix((MAX_FRAME_BYTES as u32 + 1).to_le_bytes()),
+            Err(FrameError::TooLarge { .. }),
+        ));
+        // u32::MAX is rejected.
+        assert!(matches!(
+            parse_length_prefix(u32::MAX.to_le_bytes()),
+            Err(FrameError::TooLarge { .. }),
+        ));
     }
 }

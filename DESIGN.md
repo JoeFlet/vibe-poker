@@ -708,5 +708,164 @@ serving as the schema source of truth.
       One in-process smoke test drives the worker through Hello →
       Welcome → ListTables → TableList against the same `ServerContext`
       the 19b TCP tests use. ✅
-    - **19d — stat persistence.** Server feeds finished hands into the
-      step-17 aggregator and writes back `LifetimeStats` per `PlayerId`.
+
+22. **Project pivot — 2026-04-28.** With the live-client smoke working,
+    the project's centre of gravity has shifted from "engine for
+    training" to **"poker server, with engine + agent training as
+    library dependencies, and a deprecated reference client."** The
+    next-generation client will be built as a separate (likely
+    non-Rust) project and consumes a documented wire protocol. This
+    repo's remaining work is therefore a refactor + server hardening
+    pass, captured in steps 20–24 below. Step 19d (per-player stat
+    persistence) is subsumed by the broader DB work in step 21c.
+
+23. **Step 20 — Trainer split.** Promote agent-training code out of
+    `poker-engine` into a new `poker-trainer` crate so the engine stays
+    a focused rules library. Files moved: `solver/` (MCCFR + blueprint
+    persistence), `abstraction/` (preflop/postflop bucketing for
+    solver keys), `dataset/` (HandStats aggregator + class-conditional
+    + windowed views), and the `poker_train` / `poker_play` /
+    `poker_dataset` binaries. `agent::personas` and `stats::StatsSink`
+    stay in the engine — the server can use personas as table-fillers
+    later without pulling in the solver. After the split,
+    `poker-engine` re-exports stay unchanged for downstream use of
+    rules + sim, and the workspace gains one more member.
+
+24. **Step 21 — Persistence (SQLite via `sqlx`).** Replace the
+    file-backed `Registry` with a SQLite-backed user/session/hand
+    store under `<data_dir>/poker.sqlite`. Migrations live in
+    `crates/poker-server/migrations/` and are run at startup.
+    - **21a — Schema + migration.** ✅ Done (2026-04-27).
+      Aggressively normalised so OAuth can land later without nulling
+      columns. Initial migration provisions every table the later
+      sub-steps need so 21b/c don't add new migrations:
+        - `users(id PK, email UNIQUE NULL, username UNIQUE NOT NULL,
+          created_at)` — identifying info only. `email` is nullable in
+          21a (Registry-equivalent flow has no email yet); 21b's
+          password-registration path requires it.
+        - `user_password(user_id PK FK, password_hash, updated_at)` —
+          one row only when the user has a password credential. OAuth
+          would land in a sibling table (e.g. `user_oauth(user_id,
+          provider, provider_user_id, ...)`).
+        - `sessions(id PK, user_id FK, key UNIQUE, device_label,
+          created_at, revoked_at NULL)` — append-only; "live session
+          for user" = newest non-revoked row. Issuing a new session
+          revokes the previous one in the same transaction.
+        - `lifetime_stats(user_id PK FK, hands, voluntary_pf,
+          raised_pf, aggressive_actions, passive_actions, showdowns,
+          chip_delta)` — single-row-per-user aggregate, mapped 1:1 to
+          `LifetimeStats`. Replaces the old `<data_dir>/users/<name>.mp`
+          file format.
+        - `hands(id PK, table_id, started_at, ended_at, log BLOB)` —
+          one row per finished hand, payload is the same
+          length-prefixed msgpack frames `FileSink` writes. Wired up
+          in 21c.
+        - `hand_seats(hand_id FK, seat, user_id FK NULL, chip_delta,
+          sat_out)` — for analytical queries without re-parsing the
+          log. Wired up in 21c.
+    - **21b — Authentication.** ✅ Done (2026-04-28). Argon2id
+      password hashing (`argon2` crate). New protocol verbs `Register
+      { email, username, password, device_label }` and `Authenticate
+      { mode: Password { identifier, password } | Session { key },
+      device_label }` returning `Welcome { session_key, player_id,
+      username, stats }` or `Rejected { reason }`. `identifier`
+      accepts email or username. A new login revokes the prior live
+      session in the same transaction; the in-memory revoke flag
+      (`Arc<AtomicBool>`) flips so the prior connection sends
+      `Goodbye { "session_revoked" }` on its next received frame.
+      Email is server-side state only — `SeatInfo` and every other
+      broadcast continues to ship username only. Bumped
+      `PROTOCOL_VERSION` to 3, dropped `ClientMessage::Hello`.
+    - **21c — Hand persistence.** ✅ Done (2026-04-28).
+      `BroadcastSink` accumulates every emitted `EngineEvent` as a
+      `FileSink`-compatible `[u32 LE len][rmp-serde]` byte log
+      alongside its per-recipient broadcast. After `Engine::run_hand`
+      returns, the table actor calls `Registry::record_hand` which
+      writes one `hands` row (table_id, started_at, ended_at, log
+      BLOB) and one `hand_seats` row per participating seat
+      (chip_delta from `SeatOutcome`, `sat_out` flag forwarded from
+      the engine). Subsumes the original step 19d. Lookups via
+      `Registry::fetch_hand` / `count_hands`.
+
+25. **Step 22 — Security audit + hardening.** A dedicated pass once
+    the persistence layer is live. Sub-steps:
+    - **22a — Wire-layer hardening.** ✅ Done (2026-04-28). Three
+      concerns covered by [crates/poker-server/tests/security.rs](crates/poker-server/tests/security.rs)
+      and [crates/poker-engine/src/net/frame.rs](crates/poker-engine/src/net/frame.rs):
+      (1) `parse_length_prefix` rejects any prefix > `MAX_FRAME_BYTES`
+      before the server allocates a payload buffer (boundary test
+      covers cap, cap+1, and `u32::MAX`); (2) a poor-man's fuzz
+      hammers `frame::decode::<ClientMessage>` and
+      `frame::decode::<ServerMessage>` with 2000 deterministic random
+      payloads — must always return Ok or Err, never panic; (3) the
+      server's pre-existing `LegalActions::is_legal` re-validation in
+      `Connection::deliver_action` is now exercised end-to-end by a
+      forged-raise test that submits `Raise(max_raise + 1)` over the
+      wire and asserts `ActionRejected`.
+    - **22b — Connection lifecycle.** ✅ Done (2026-04-28).
+      [crates/poker-server/src/limits.rs](crates/poker-server/src/limits.rs)
+      defines `ConnectionLimits { idle_timeout, rate_burst,
+      rate_refill_per_sec }` (defaults: 60s / 30 burst / 20 per sec)
+      and a `TokenBucket`. The handshake read and the reader loop are
+      both wrapped in `tokio::time::timeout(idle_timeout, …)`; on
+      idle the post-handshake side queues
+      `Goodbye { reason: "idle timeout" }`. Each post-handshake
+      frame consumes one token; over-budget peers get
+      `Goodbye { reason: "rate limit exceeded" }` and a teardown.
+      Tests: `idle_handshake_drops_connection` and
+      `flood_triggers_rate_limit_goodbye` in
+      [crates/poker-server/tests/security.rs](crates/poker-server/tests/security.rs).
+    - **22c — Reconnect / duplicate-session handling.** ✅ Done
+      (2026-04-28). The seat now holds an `Arc<SeatLink>` (a
+      `RwLock<Arc<Connection>>` indirection in
+      [crates/poker-server/src/connection.rs](crates/poker-server/src/connection.rs))
+      which is shared by `Table::Seat`, the per-hand snapshot,
+      `RemoteAgent`, and `BroadcastSink`. On a second login for the
+      same user, `Table::reconnect_player` swaps the link in place,
+      moves any in-flight `PendingAction` (with its `oneshot::Sender`)
+      from the old connection to the new one, and re-issues a
+      matching `Prompt` over the new socket — so the engine's blocked
+      `act()` resolves on the new device and the hand keeps going.
+      Each `Connection` carries its `session_id`; the cleanup path on
+      a superseded session skips `force_leave`/`record_leave` so it
+      can't kick the seat out from under the new owner. Test:
+      `reconnect_takes_over_seat_mid_hand` in
+      [crates/poker-server/tests/security.rs](crates/poker-server/tests/security.rs).
+      Known limitation: the current hand's `HoleCardsDealt` is not
+      replayed to the reconnecting client, so they play the rest of
+      the hand with cards face-down on their UI; full state-replay
+      is deferred to step 23 alongside the protocol spec.
+
+26. **Step 23 — `PROTOCOL.md`.** ✅ Done (2026-04-29). Long-form
+    functional spec at
+    [crates/poker-engine/src/net/PROTOCOL.md](crates/poker-engine/src/net/PROTOCOL.md),
+    sufficient for a non-Rust client to be built without reading
+    server source. Covers: framing (`[u32 LE length][msgpack bytes]`,
+    `MAX_FRAME_BYTES` cap), handshake state machine, every
+    `ClientMessage` / `ServerMessage` variant with field-by-field
+    semantics, ordering guarantees (e.g. `JoinedTable` always precedes
+    the first `TableState`; per-recipient hole-card masking on
+    `HandEnded`), error model (`Rejected` vs `ActionRejected` vs
+    `Goodbye`), idle/rate-limit policy, reconnect / mid-hand seat
+    takeover, and a msgpack schema appendix per variant. Versioned in
+    lockstep with `PROTOCOL_VERSION` (currently 3).
+
+27. **Step 24 — Deprecate `poker-client` & refocus docs.** ✅ Done
+    (2026-04-29). `crates/poker-client/README.md` is now explicitly
+    flagged "frozen at `PROTOCOL_VERSION = 3`, only protocol-
+    compatibility bug fixes" with a pointer to the sibling client
+    repo. Per-crate READMEs (engine, trainer, server, client) own
+    their own specifics; the root `README.md` carries cross-cutting
+    concerns (end-to-end loop, inter-crate contracts, workspace
+    invariants, roadmap). The next-generation playable client is
+    being developed in a **separate sibling repository** and is
+    expected to land here later as a git **submodule** — at which
+    point a new step will be added covering the wiring (location
+    under the workspace, build hooks, `cargo`/sibling-toolchain
+    interop). Until then, references to "the client" in this repo
+    mean the deprecated in-tree harness.
+
+This concludes the originally-planned step list. Future work — the
+sibling-client submodule import, post-launch server hardening,
+operational tooling — will be appended as new numbered steps when
+it's planned in detail.

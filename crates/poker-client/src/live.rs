@@ -18,7 +18,7 @@ use poker_engine::net::protocol::{
     ClientMessage, PlayerId, SeatInfo, ServerMessage, TableId, TableInfo,
 };
 
-use crate::live_net::{LiveClient, LiveEvent};
+use crate::live_net::{LiveClient, LiveEvent, LoginRequest};
 use crate::snapshot::{render_snapshot, Snapshot};
 
 /// What the client is currently doing.
@@ -67,8 +67,8 @@ pub struct LiveApp {
 }
 
 impl LiveApp {
-    pub fn connect(addr: String, username: String) -> Self {
-        let client = LiveClient::connect(addr.clone(), username.clone());
+    pub fn connect(addr: String, username: String, login: LoginRequest) -> Self {
+        let client = LiveClient::connect(addr.clone(), login);
         LiveApp {
             client,
             addr,

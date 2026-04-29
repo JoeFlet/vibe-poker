@@ -1,107 +1,46 @@
 # poker
 
-A high-performance Texas Hold'em engine in Rust, plus the tools that ride on top of it: a stats reporter, an MCCFR blueprint trainer, a head-to-head play harness, and an `egui` replay viewer for stepping through recorded hands.
+A Cargo workspace for a high-performance Texas Hold'em **rules engine**, an **agent trainer** built on top, and a **TCP poker server** that lets remote clients play hands. An `egui` reference client is shipped alongside as a smoke-testing harness; the next-generation playable client is being developed in a separate repository and is planned to land here later as a git submodule.
 
-The repository is a Cargo workspace:
+## The four pieces
 
-| Crate | Role |
-|---|---|
-| [crates/poker-engine](crates/poker-engine/) | Core library (game state, betting, evaluator, sim runner, MCCFR solver) and CLI binaries: `poker_report`, `poker_train`, `poker_play` |
-| [crates/poker-server](crates/poker-server/) | Async TCP game host — drives `Engine` on `spawn_blocking`, fans events to clients, persists player records |
-| [crates/poker-client](crates/poker-client/) | `egui`/`eframe` desktop app — replay viewer (`--replay`) and live client (`--connect`) |
+| Crate | Role | Status |
+|---|---|---|
+| [crates/poker-engine](crates/poker-engine/) | Pure-Rust rules library: cards, evaluator, game state, betting, agents, sim, stats, wire types | Stable |
+| [crates/poker-trainer](crates/poker-trainer/) | MCCFR solver, dataset aggregator, `poker_train` / `poker_play` / `poker_dataset` CLIs | Stable |
+| [crates/poker-server](crates/poker-server/) | Async TCP server wrapping `Engine::run_hand` for live play | **Active focus** |
+| [crates/poker-client](crates/poker-client/) | `egui` replay viewer + reference live client | Deprecated; in-tree as a smoke-test harness, frozen at `PROTOCOL_VERSION = 3`. Real client is a sibling repo (planned submodule). |
 
-## Goals
+Each crate has its own README with the specifics. The rest of this document is the cross-cutting view — how the pieces fit together, what contracts they share, and how to drive the workspace from end to end.
 
-- **Fast simulation** — no heap allocation in the hot path, integer chip arithmetic throughout, lookup-table hand evaluation via `rs_poker`
-- **Clean AI interface** — implement one trait (`Agent`) to plug in any decision-making logic
-- **Observable & replayable** — structured event stream with separate deck and agent seeds so any hand can be replayed exactly; logs are durable on disk via `FileSink`
-- **Correct pot logic** — side pots, split pots, and dead money from folds verified by multi-player property tests
-
----
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│  poker-client (egui)   │   bots / scripts            │
-│  replay viewer · live  │   train / play / report     │
-├──────────────────────────────────────────────────────┤
-│              MCCFR solver · blueprints               │
-├──────────────────────────────────────────────────────┤
-│  Agent trait  ·  Observation  ·  built-in agents     │
-├──────────────────────────────────────────────────────┤
-│  Engine  ·  BettingRules  ·  EventSink  ·  SimRunner │
-├──────────────────────────────────────────────────────┤
-│  Card / Deck  ·  HandEvaluator  ·  HandRank          │
-└──────────────────────────────────────────────────────┘
-```
-
----
-
-## Normal usage: train → play → replay
-
-The shippable end-to-end loop is three commands. Run them from the workspace root.
-
-### 1. Train an MCCFR blueprint
+## End-to-end loop
 
 ```sh
-cargo run --release --bin poker_train -- \
-    --iters 200000 \
-    --out blueprint.mp \
-    --seed 7
+# 1. Train a blueprint
+cargo run --release -p poker-trainer --bin poker_train -- \
+    --iters 200000 --out blueprint.mp --seed 7
+
+# 2. Play it against bots and capture an event log
+cargo run --release -p poker-trainer --bin poker_play -- \
+    --blueprint blueprint.mp --hands 5000 \
+    --agents blueprint,calling --log session.mp
+
+# 3. Replay the session visually
+cargo run --release -p poker-client -- --replay session.mp
+
+# 4. Or play live against a server
+cargo run -p poker-server &
+cargo run -p poker-client -- --connect 127.0.0.1:7878 --username alice
 ```
 
-`poker_train` runs external-sampling Monte Carlo CFR over the engine's abstract game tree. Output is a versioned MessagePack file (schema-tagged with the abstraction so loads fail loudly if it changes). A small training run (a few thousand iterations) finishes in well under a second and is enough to smoke-test the loop; production-quality play wants ≥1e6 iterations.
+For training-specific flags see the [trainer README](crates/poker-trainer/), for server flags the [server README](crates/poker-server/).
 
-Key flags:
+## Quick stats run (`poker_report`)
 
-```
---iters    <N>        MCCFR iterations
---out      <path>     Blueprint output path
---seed     <N>        Base seed for the sampling RNG
---stacks   <list>     Per-seat stacks (default 200,200)
---blinds   <sb>/<bb>  Blind levels      (default 1/2)
---progress            Print iter/sec and info-set growth
-```
-
-### 2. Play the blueprint against bots
-
-```sh
-cargo run --release --bin poker_play -- \
-    --blueprint blueprint.mp \
-    --hands 5000 \
-    --agents blueprint,calling \
-    --log session.mp
-```
-
-`poker_play` loads a blueprint, wraps it in a `StrategyAdapter`, and runs head-to-head against built-in bots. Per-seat **VPIP**, **PFR**, **AF**, win-rate, and chip-EV print at the end via the same `print_report` table as `poker_report`. With `--log <path>`, the live run is teed into a `FileSink` so you get both the stats report and a durable event log from one pass.
-
-Agent specs (one per seat, comma-separated):
-
-| Spec | Behaviour |
-|---|---|
-| `blueprint` | The trained policy from `--blueprint` |
-| `calling` | `CallingStation` — checks free, otherwise calls |
-| `random:<seed>` | `RandomAgent` seeded at `<seed>` |
-
-### 3. Replay the session visually
-
-```sh
-cargo run --release --bin poker-client -- --replay session.mp
-```
-
-The `egui` viewer loads the event log and lets you scrub through it: a cursor walks `events[0..=i]` and each frame derives a snapshot — hand id / dealer / street / pot, board cards, per-seat hole cards with folded/all-in/committed flags, the action log, and the final `HandResult` block when the hand terminates. ⏮◀▶⏭ buttons step the cursor; the slider jumps anywhere; clicking an event in the side panel snaps the cursor to it.
-
-Launch with no arguments for a stub window that prompts for `--replay`.
-
----
-
-## Quick benchmark / stats run
-
-For "what does this matchup look like over N hands" without bothering with a blueprint, use `poker_report`:
+For a fast "what does this matchup look like over N hands" without bothering with a blueprint, the engine ships a single CLI:
 
 ```
-cargo run --release --bin poker_report -- [OPTIONS]
+cargo run --release -p poker_engine -- [OPTIONS]
 
 Options:
   --hands   <N>           Hands to simulate            [default: 1000]
@@ -121,477 +60,62 @@ Options:
   --threads <N>           Parallel threads             [default: 1]
 ```
 
-Example output:
+## Inter-crate contracts
 
-```
-poker_report  ·  1000 hands  ·  1/2 NL Hold'em  ·  200bb starting stacks
+Three shared formats are the load-bearing seams. Touching any of them is a workspace-wide concern.
 
- Seat  Agent            Hands   Win%    Chip EV   VPIP    PFR     AF
- ────  ───────────────  ──────  ──────  ────────  ──────  ──────  ─────
- 0     calling          1000    36.2%   +0.84     45.3%   0.0%    0.00
- 1     random:1         1000    31.4%   -1.21     52.1%   18.4%   0.43
- 2     random:2         1000    32.4%   +0.37     45.8%   16.1%   0.38
+### `EngineEvent` stream
 
- Total hands: 1000  ·  Avg pot: 8.4 chips
-```
+Every meaningful moment in a hand emits an event: `HandStarted` / `HoleCardsDealt` / `BoardDealt` / `ActionTaken` / `PlayerAllIn` / `HandEnded`. The engine itself stores nothing; events flow into whatever `EventSink` the caller supplies.
 
----
-
-## Library: running a single hand
-
-```rust
-use poker_engine::{
-    agent::builtin::RandomAgent,
-    core::RsPokerEvaluator,
-    game::{BettingRules, Engine, NullSink},
-};
-
-fn main() {
-    let rules = BettingRules::no_limit_holdem(1, 2, 4);
-    let engine = Engine::new(rules, RsPokerEvaluator);
-
-    let stacks = [200u32; 4];
-    let dealer = 0;
-
-    let mut agents: Vec<Box<dyn poker_engine::agent::Agent>> = vec![
-        Box::new(RandomAgent::new(1)),
-        Box::new(RandomAgent::new(2)),
-        Box::new(RandomAgent::new(3)),
-        Box::new(RandomAgent::new(4)),
-    ];
-
-    let result = engine.run_hand(
-        /*hand_id*/  1,
-        /*deck_seed*/ 42,
-        &stacks,
-        dealer,
-        &mut agents,
-        &mut NullSink,
-    );
-
-    for outcome in &result.seats {
-        println!("seat {}: {:+} chips", outcome.seat, outcome.chip_delta);
-    }
-}
-```
-
-Use `RsPokerEvaluator` for production — it's the lookup-table 7-card evaluator from `rs_poker`. `NaiveEvaluator` (`C(7,5)` brute force) is kept for cross-checking.
-
----
-
-## Writing an Agent
-
-Implement the `Agent` trait. Only `act` is required; the lifecycle hooks all default to no-ops.
-
-```rust
-use poker_engine::agent::{Agent, Observation, RunConfig};
-use poker_engine::game::{Action, HandId, HandResult};
-
-struct MyAgent { /* state */ }
-
-impl Agent for MyAgent {
-    fn act(&mut self, obs: &Observation<'_>) -> Action {
-        // obs.hole_cards     — your two private cards
-        // obs.board          — community cards dealt so far (0–5)
-        // obs.legal_actions  — what moves are currently valid
-        // obs.players        — public state of all seats
-        // obs.pot            — current pot total
-        // obs.street         — Preflop / Flop / Turn / River
-        // obs.position       — your seat index
-
-        if obs.legal_actions.can_check { Action::Check } else { Action::Call }
-    }
-
-    fn on_run_start(&mut self, _config: &RunConfig) {}   // load durable state here
-    fn on_run_end(&mut self) {}                          // persist durable state here
-    fn on_hand_start(&mut self, _hand_id: HandId) {}     // reset transient state
-    fn on_hand_end(&mut self, _result: &HandResult) {}   // update opponent models
-}
-```
-
-### Action variants
-
-| Variant | When legal |
+| Sink | Used by |
 |---|---|
-| `Action::Fold` | Always |
-| `Action::Check` | `legal_actions.can_check` — no bet to face |
-| `Action::Call` | `legal_actions.can_call` — there is a bet to face and you have chips |
-| `Action::Raise(amount)` | `legal_actions.can_raise` — `amount` is the **total** bet this street, must be in `[min_raise, max_raise]` |
-| `Action::AllIn` | Always when you have chips — pushes your entire remaining stack |
+| `NullSink` | Bulk training / report runs |
+| `VecSink` | Tests, in-memory replay capture |
+| `FileSink` | `poker_play --log`, `poker_dataset --out`, replay viewer input |
+| `StatsSink` | `poker_report`, `poker_play` |
+| Server-side `BroadcastSink` | `poker-server` (per-recipient hole-card masking) |
 
-```rust
-pub struct LegalActions {
-    pub can_check:    bool,
-    pub can_call:     bool,
-    pub call_amount:  u32,
-    pub can_raise:    bool,
-    pub min_raise:    u32,
-    pub max_raise:    u32,
-    pub all_in_amount: u32,
-}
-```
+The same event stream feeds the [snapshot derivation](crates/poker-client/src/snapshot.rs) used by both replay and live modes of `poker-client`.
 
----
+### `FileSink` log format
 
-## Events & observability
-
-Pass any `EventSink` to `run_hand` (or to `SimRunner::run`) to capture the event stream. The engine emits events for every meaningful moment without storing anything itself.
-
-### Event types
-
-| Event | Payload |
-|---|---|
-| `HandStarted` | `hand_id`, `dealer`, `deck_seed` |
-| `HoleCardsDealt` | `seat`, `cards: [Card; 2]` |
-| `BoardDealt` | `street`, `cards` |
-| `ActionTaken` | `seat`, `action`, `pot_total` |
-| `PlayerAllIn` | `seat`, `total_committed` |
-| `HandEnded` | `hand_id`, `result: HandResult` |
-
-### Built-in sinks
-
-| Sink | Behaviour |
-|---|---|
-| `NullSink` | Discards all events. Zero overhead for bulk simulation. |
-| `VecSink` | Collects events into `events: Vec<EngineEvent>` — for tests and replay capture. |
-| `FileSink` | Streams events to disk as `[u32 LE length][rmp-serde bytes]` frames. Flushed on drop. |
-| `StatsSink` | Aggregates per-seat VPIP / PFR / AF / win% / chip EV in real time. |
-
-Round-trip a `FileSink` log with `read_event_log`:
-
-```rust
-use poker_engine::game::{FileSink, read_event_log};
-
-let mut sink = FileSink::create("session.mp")?;
-runner.run(1_000, &config, &mut sink);
-drop(sink); // flushes
-
-let events = read_event_log("session.mp")?;
-println!("recorded {} events", events.len());
-```
-
-### Replay & determinism
-
-The `deck_seed` from `HandStarted` is the only value needed to reproduce the exact board and deal order. Agent seeds are passed at construction and are fully independent — the engine never touches them. To replay a hand, pass the same `deck_seed` to `run_hand`.
-
----
-
-## Built-in agents
-
-| Agent | Behaviour |
-|---|---|
-| `RandomAgent::new(seed)` | Picks uniformly at random from all legal actions |
-| `CallingStation` | Checks when free, otherwise calls. Never raises. |
-| `ScriptedAgent::new(actions)` | Follows a fixed action script in order. Useful for unit tests. |
-| `HumanAgent::new()` | Reads moves from stdin. Used by `poker_report --agents human,…` |
-| `StrategyAdapter` | Wraps a `Strategy` (e.g. `BlueprintStrategy::from_table(...)`) as an `Agent` |
-
-### Personas (in [agent::personas](crates/poker-engine/src/agent/personas.rs))
-
-Hand-tuned policies that gate actions on a shared `Strength` bucket. Distinct enough to produce clean per-class stat profiles for opponent-modelling work.
-
-| Persona | Profile |
-|---|---|
-| `Nit::new(seed)` | Very tight, mostly passive |
-| `Tag::new(seed)` | Tight-aggressive (TAG) |
-| `Lag::new(seed)` | Loose-aggressive (LAG) |
-| `Maniac::new(seed)` | Raises or shoves nearly everything |
-| `TiltProne::new(seed)` | TAG → LAG mode after losses; tracks recent chip swings |
-
-CLI specs match the struct names: `nit:<seed>`, `tag:<seed>`, `lag:<seed>`, `maniac:<seed>`, `tilt:<seed>`. Use them anywhere `--agents` is accepted.
-
----
-
-## Opponent dataset (`poker_dataset`)
-
-Round-robin every persona heads-up against every other persona, then print three views over the resulting `HandStats` rows.
-
-```sh
-cargo run --release --bin poker_dataset -- \
-    --personas nit,tag,lag,maniac,tilt \
-    --hands 2000 \
-    --window 500 \
-    --out logs/
-```
-
-Outputs:
-
-1. **Per-persona summary** — pooled VPIP / PFR / AF / WTSD% / chip EV across every matchup the persona played in.
-2. **Class-conditional matrix** — rows for each `(own, opponent)` pair: how does TAG behave against a Maniac vs against a Nit? Where does LAG bleed money?
-3. **Windowed time series** — rolling N-hand windows per persona, surfacing time-correlated drift (the `tilt` persona is the canonical example).
-
-`--out <dir>` writes a `<a>_vs_<b>.mp` `FileSink` log per matchup so any session can be replayed in `poker-client --replay <path>` or re-aggregated offline. The aggregator API (`extract_hand_stats`, `class_conditional`, `windowed`) is in [dataset/](crates/poker-engine/src/dataset/) and works on any event log — your own bots and future client/server traffic slot in unchanged.
-
----
-
-## Persistence
-
-Two flavours, both MessagePack:
-
-| What | API | Format |
-|---|---|---|
-| Trained MCCFR blueprint | `solver::save_blueprint` / `load_blueprint` | Schema-versioned + abstraction-tagged. Load fails if either differs. |
-| Event log | `FileSink::create` / `read_event_log` | Length-prefixed `[u32 LE][msgpack]` frames. Streaming-friendly. |
-
-Custom agents can manage their own persistence via the lifecycle hooks:
-
-```rust
-fn on_run_start(&mut self, _: &RunConfig) {
-    if let Ok(bytes) = std::fs::read("model.mp") {
-        if let Ok(s) = rmp_serde::from_slice(&bytes) { self.model = s; }
-    }
-}
-
-fn on_run_end(&mut self) {
-    let bytes = rmp_serde::to_vec(&self.model).unwrap();
-    std::fs::write("model.mp", bytes).unwrap();
-}
-```
-
----
-
-## Table configuration
-
-```rust
-let rules = BettingRules::no_limit_holdem(1, 2, 6); // sb, bb, max_players
-
-// Custom (e.g. with ante)
-let rules = BettingRules {
-    variant: BetVariant::NoLimit,
-    small_blind: 5,
-    big_blind: 10,
-    ante: 10,
-    max_players: 9,
-};
-```
-
-## Chip conventions
-
-- Chip values are `u32`, denominated in big-blind units by convention (no enforced denomination).
-- No floating-point arithmetic. Split pots divide evenly; the remainder chip goes to the first eligible winner left of the dealer.
-- `SeatOutcome::chip_delta` is `i32`: positive = net gain, negative = net loss for that hand.
-
----
-
-## Bulk simulation
-
-### Single-threaded
-
-```rust
-use poker_engine::sim::{SimConfig, SimRunner};
-
-let mut runner = SimRunner::new(engine, agents, stacks);
-let result = runner.run(10_000, &SimConfig::deterministic(42), &mut NullSink);
-
-for (seat, cpg) in result.chips_per_hand().iter().enumerate() {
-    println!("seat {seat}: {cpg:+.3} chips/hand");
-}
-```
-
-### Parallel
-
-Each thread builds its own engine and agents from the supplied factory closures.
-
-```rust
-use poker_engine::sim::run_parallel;
-
-let result = run_parallel(
-    1_000_000,
-    8,
-    &stacks,
-    &|| Engine::new(BettingRules::no_limit_holdem(1, 2, 3), RsPokerEvaluator),
-    &|| vec![
-        Box::new(MyAgent::new()) as Box<dyn Agent>,
-        Box::new(CallingStation),
-        Box::new(RandomAgent::new(0)),
-    ],
-    &SimConfig::deterministic(1),
-);
-```
-
-### `SimConfig`
-
-```rust
-SimConfig { seed: SeedMode::Random,        stack_policy: StackPolicy::Reset      } // default
-SimConfig::deterministic(42);                                                       // hand i → seed base+i
-SimConfig { seed: SeedMode::Random,        stack_policy: StackPolicy::Persistent } // stacks carry over; busts sit out
-```
-
-After a `Persistent` run, `runner.reset_stacks()` rebuys everyone to starting stacks.
-
----
-
-## Project layout
-
-```
-crates/
-  poker-engine/
-    src/
-      core/         Card, Deck, HandEvaluator (RsPokerEvaluator + NaiveEvaluator), HandRank
-      game/         Engine, BettingRules, EngineEvent + sinks, pot_calc, state
-      agent/        Agent trait, Observation, builtin (Random/Calling/Scripted/Human)
-      sim/          SimRunner, run_parallel, SimConfig, SeedMode, StackPolicy
-      solver/       MCCFR trainer, info-set keying, BlueprintStrategy, save/load_blueprint
-      abstraction/  Card-bucketing for solver keys (PreflopClass + postflop placeholder)
-      stats/        StatsSink, print_report
-      bin/
-        poker_train.rs   MCCFR training loop → blueprint file
-        poker_play.rs    Blueprint vs bots, optional --log
-      main.rs            poker_report binary
-    tests/          Integration + multi-player correctness tests
-    benches/        Criterion benchmarks
-  poker-client/
-    src/
-      main.rs       eframe entry, --replay CLI
-      replay.rs     ReplayApp + Snapshot derivation + egui rendering
-DESIGN.md           Architecture decisions and step-by-step build plan
-```
-
----
-
-## Roadmap
-
-| Step | Status |
-|---|---|
-| Card / Deck / HandEvaluator (`RsPokerEvaluator` + `NaiveEvaluator`) | ✅ |
-| `GameState`, `BettingRules`, action validation | ✅ |
-| Pot / showdown resolution (side pots, splits) | ✅ |
-| Event system (`EngineEvent`, sinks, `FileSink` + `read_event_log`) | ✅ |
-| Agent lifecycle hooks + MessagePack persistence | ✅ |
-| `SimRunner` (single-threaded and parallel) | ✅ |
-| `StatsSink` + `poker_report` CLI | ✅ |
-| MCCFR solver + abstraction layer + `BlueprintStrategy` | ✅ |
-| Blueprint persistence (schema-versioned, abstraction-tagged) | ✅ |
-| Multi-player correctness pass (3- and 6-max property tests) | ✅ |
-| `poker_train` + `poker_play` CLI loop | ✅ |
-| `egui` replay viewer (`poker-client --replay`) | ✅ |
-| Persona bot pool + dataset aggregator + `poker_dataset` driver | ✅ |
-| `poker-server` TCP host (19a–19b): handshake, table actor, `BroadcastSink` | ✅ |
-| Live `poker-client` (19c): `LiveClient` worker + egui state machine | ✅ |
-| Exploit layer: opponent profiler + best-response mixing | 🔲 Next |
-| Server-side stat persistence (19d): `LifetimeStats` written back per hand | 🔲 Planned |
-
-The full plan with rationale lives in [DESIGN.md](DESIGN.md).
-
----
-
-## Live server (`poker-server`)
-
-`poker-server` is a fully implemented TCP game host. It drives the synchronous
-engine on `tokio::task::spawn_blocking`, fans `EngineEvent`s to every seated
-player (with hole-card masking), and persists player records across sessions.
-
-### Starting the server
-
-```sh
-# Localhost only (default)
-cargo run -p poker-server
-
-# Accept connections from other machines
-cargo run -p poker-server -- --bind 0.0.0.0:7878
-
-# Custom table configuration
-cargo run -p poker-server -- \
-    --bind 0.0.0.0:9000 \
-    --small-blind 5 \
-    --big-blind 10 \
-    --max-seats 6 \
-    --buy-in 1000 \
-    --data-dir /var/lib/poker
-```
-
-All flags with defaults:
-
-| Flag | Default | Description |
-|---|---|---|
-| `--bind` | `127.0.0.1:7878` | TCP address to listen on |
-| `--data-dir` | `data` | Directory for persistent player records (`users/<name>.mp`) |
-| `--small-blind` | `1` | Small blind for the default table |
-| `--big-blind` | `2` | Big blind for the default table |
-| `--max-seats` | `2` | Seat count for the default table |
-| `--buy-in` | `200` | Default buy-in chips suggested to clients |
-
-### Connecting as a client
-
-```sh
-cargo run -p poker-client -- --connect 127.0.0.1:7878 --username alice
-```
-
-The `egui` live client goes through: **Connecting → Lobby** (table picker with
-refresh and buy-in input) **→ Seated** (snapshot view, seat list, action panel).
-The action panel lights up on a `Prompt` and submits fold / check / call / all-in
-or a min-/max-bounded raise slider.
+`[u32 LE length][rmp-serde EngineEvent bytes]` frames, written through `BufWriter`, flushed on drop. Round-trip with `read_event_log`. Streaming-friendly: a server can spool live broadcasts straight to disk without re-encoding.
 
 ### Wire protocol
 
-Transport is a raw TCP stream; there is no HTTP or WebSocket layer.
+Defined once in [crates/poker-engine/src/net/](crates/poker-engine/src/net/) and linked by both `poker-server` and `poker-client`. Same `[u32 LE length][rmp-serde bytes]` framing as `FileSink`, but carrying `ClientMessage` / `ServerMessage` envelopes instead of bare `EngineEvent`s. `PROTOCOL_VERSION` (currently 3) is bumped on any backwards-incompatible change. The long-form spec — sufficient to build a non-Rust client without reading server source — lives at [crates/poker-engine/src/net/PROTOCOL.md](crates/poker-engine/src/net/PROTOCOL.md).
 
-**Frame format** (same as `FileSink` on disk):
-```
-[4-byte u32 LE payload-length][rmp-serde/msgpack payload]
-```
+## Workspace-wide invariants
 
-**Protocol version**: `2` (bumped on any backwards-incompatible message change).
+These apply across every crate:
 
-**Session flow**:
+- **Determinism.** A hand's `deck_seed` (in `HandStarted`) is the only value needed to reproduce the deal. Agent seeds are passed at construction and never touched by the engine. Don't pull entropy inside the engine; thread it through.
+- **Integer chips.** Chip values are `u32`, denominated in big-blind units by convention (no enforced denomination). Split-pot remainders go to the first eligible winner left of the dealer. `SeatOutcome::chip_delta` is `i32`. No floating-point arithmetic anywhere.
+- **Hole-card visibility.** `HoleCardsDealt` is per-seat private. `HandEnded` reveals hole cards only at a proper showdown (river dealt + ≥2 non-folded contenders) and even then only for non-folded seats. The server's `BroadcastSink` enforces this per-recipient; the engine itself never strips them.
 
-```
-Client                          Server
-  │  Hello { version, username } │
-  │ ──────────────────────────> │
-  │  Welcome { player_id, stats }│   (or Rejected { reason })
-  │ <────────────────────────── │
-  │                             │
-  │  ListTables                 │
-  │ ──────────────────────────> │
-  │  TableList { tables }       │
-  │ <────────────────────────── │
-  │                             │
-  │  JoinTable { table_id, buy_in }
-  │ ──────────────────────────> │
-  │  JoinedTable / ActionRejected
-  │ <────────────────────────── │
-  │                             │
-  │            [hand plays out] │
-  │  TableEvent { EngineEvent } │  (repeated — hole cards masked per-recipient)
-  │ <────────────────────────── │
-  │  Prompt { legal, deadline } │
-  │ <────────────────────────── │
-  │  SubmitAction { action }    │
-  │ ──────────────────────────> │
-  │                             │
-  │  Disconnect                 │
-  │ ──────────────────────────> │
-  │  Goodbye { reason }         │
-  │ <────────────────────────── │
-```
+## Roadmap
 
-**Username rules**: 3–24 chars, ASCII alphanumeric / `_` / `-` / `.`, must start
-with a letter or digit. The same validation function is exposed from
-`poker_engine::net::protocol::is_valid_username` so clients can pre-validate.
+Step plan and status live in [DESIGN.md](DESIGN.md). At a glance:
 
-**Reconnect**: a player who reconnects with the same username gets the same stable
-`PlayerId` and `LifetimeStats` from the persistent registry.
+| Step | Status |
+|---|---|
+| 1–17 (engine, sim, stats, MCCFR, blueprints, dataset, replay viewer) | ✅ |
+| 18 (persona bot pool + dataset aggregator) | ✅ |
+| 19a–c (TCP server skeleton + game messages + live client) | ✅ |
+| 20 (trainer split — this crate's birth) | ✅ |
+| 21a (SQLite schema + migration + Registry replacement) | ✅ |
+| 21b (Argon2id auth + session keys, `Authenticate` verb) | ✅ |
+| 21c (Per-hand persistence into `hands` + `hand_seats`) | ✅ |
+| 22a (wire-layer hardening + LegalActions forgery test) | ✅ |
+| 22b (idle timeout + per-connection rate limit) | ✅ |
+| 22c (reconnect mid-hand) | ✅ |
+| 23 (`PROTOCOL.md` long-form spec) | ✅ |
+| 24 (deprecate `poker-client` and refocus docs) | ✅ |
 
-**Missed deadline**: if a seated player does not reply to a `Prompt` within
-`deadline_ms`, the server auto-folds that seat and the hand continues.
+Steps 1–24 cover everything originally planned for the in-tree workspace. Future work — most prominently importing the sibling client repo as a submodule and any post-launch server hardening — will be appended as new steps when the time comes.
 
-**Privacy**: `HoleCardsDealt` events are delivered only to their owner.
-`HandEnded` masks all hole cards for non-recipients except at proper showdowns
-(river dealt with ≥ 2 non-folded contenders).
-
-### Logging
-
-The server logs at `info` level by default, `debug` for the `poker_server`
-module. Override with `RUST_LOG`:
-
-```sh
-RUST_LOG=debug cargo run -p poker-server
-```
-
----
-
-## Running tests / benchmarks
+## Tests
 
 ```sh
 cargo test --workspace

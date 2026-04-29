@@ -1,201 +1,596 @@
-//! Per-username persistent records + an in-memory connection map.
+//! SQLite-backed user registry, password auth, and session revocation.
 //!
-//! Records live as `<data_dir>/users/<username>.mp` (msgpack) so a
-//! returning client gets the same `PlayerId` and lifetime stats it had
-//! before. The on-disk format is intentionally not the wire format —
-//! `PlayerRecord` carries server-only fields (creation timestamp,
-//! schema version) that the client doesn't need to see.
+//! The registry owns three concerns:
 //!
-//! Concurrency: the registry holds an in-memory map of who's currently
-//! online (keyed by `PlayerId`) so a second connection from the same
-//! username can be rejected with `AlreadyConnected`. The map is guarded
-//! by a `Mutex`; lookups are cheap.
+//! 1. **Persistent identity** — `users`, `user_password`,
+//!    `lifetime_stats` rows in `<data_dir>/poker.sqlite`. Reconnecting
+//!    with the same credentials returns the same `PlayerId` (= user
+//!    row id) and lifetime stats.
+//! 2. **Authentication** — Argon2id password hashing, session keys
+//!    (32 random bytes hex-encoded), and the rule that issuing a new
+//!    session revokes any prior session for the same user in the same
+//!    transaction.
+//! 3. **Online presence** — an in-memory map keyed by `PlayerId`
+//!    holding the *current* session's id + a shared "revoked" flag.
+//!    When a new login lands for an already-online player we flip the
+//!    prior flag; the session reader loop checks the flag on each
+//!    iteration and tears down its connection cleanly.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
-use serde::{Deserialize, Serialize};
+use argon2::password_hash::SaltString;
+use argon2::password_hash::rand_core::{OsRng, RngCore};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use sqlx::SqlitePool;
 use tokio::fs;
 use tokio::sync::Mutex;
 
-use poker_engine::net::protocol::{is_valid_username, LifetimeStats, PlayerId};
+use poker_engine::game::SeatIndex;
+use poker_engine::net::protocol::{
+    LifetimeStats, PlayerId, TableId, is_valid_email, is_valid_password, is_valid_username,
+};
 
-/// Bumped if `PlayerRecord` ever changes shape on disk.
-const RECORD_SCHEMA_VERSION: u32 = 1;
+use crate::db;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
     #[error("invalid username")]
     InvalidUsername,
-    #[error("username already connected")]
-    AlreadyConnected,
+    #[error("invalid email")]
+    InvalidEmail,
+    #[error("invalid password")]
+    InvalidPassword,
+    #[error("username already in use")]
+    UsernameInUse,
+    #[error("email already in use")]
+    EmailInUse,
+    #[error("bad credentials")]
+    BadCredentials,
+    #[error("session revoked")]
+    SessionRevoked,
+    #[error("unknown session")]
+    UnknownSession,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("decode error: {0}")]
-    Decode(#[from] rmp_serde::decode::Error),
-    #[error("encode error: {0}")]
-    Encode(#[from] rmp_serde::encode::Error),
-    #[error("schema mismatch: file v{found}, expected v{expected}")]
-    SchemaMismatch { found: u32, expected: u32 },
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("migration error: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("password hash error: {0}")]
+    Hash(String),
 }
 
-/// On-disk record for one player.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl From<argon2::password_hash::Error> for RegistryError {
+    fn from(e: argon2::password_hash::Error) -> Self {
+        Self::Hash(e.to_string())
+    }
+}
+
+/// In-memory view of one player's persistent record.
+#[derive(Debug, Clone)]
 pub struct PlayerRecord {
-    pub schema_version: u32,
     pub player_id: PlayerId,
     pub username: String,
-    /// Seconds since UNIX epoch. Stored for diagnostics; not load-bearing.
+    /// Seconds since UNIX epoch when the user row was created. Stored
+    /// for diagnostics; not load-bearing.
     pub created_unix: u64,
     pub stats: LifetimeStats,
 }
 
-/// Server-side player registry: file-backed records + an online set.
+/// Successful login result. `revoked` flips to `true` once a newer
+/// session for the same user replaces this one — the session reader
+/// loop polls it to know when to disconnect.
+#[derive(Debug)]
+pub struct AuthSuccess {
+    pub record: PlayerRecord,
+    pub session_key: String,
+    pub session_id: i64,
+    pub revoked: Arc<AtomicBool>,
+}
+
+struct OnlineEntry {
+    session_id: i64,
+    revoked: Arc<AtomicBool>,
+    #[allow(dead_code)]
+    username: String,
+}
+
+/// One row's worth of `hand_seats` data: who sat where, how their
+/// stack changed, and whether they were sat-out for the hand.
+#[derive(Debug, Clone)]
+pub struct HandSeatRecord {
+    pub seat: SeatIndex,
+    pub player_id: Option<PlayerId>,
+    pub chip_delta: i32,
+    pub sat_out: bool,
+}
+
+/// Persisted hand: header columns plus the full `FileSink`-compatible
+/// event log and per-seat outcome rows. Returned by [`Registry::fetch_hand`].
+#[derive(Debug, Clone)]
+pub struct HandRecord {
+    pub id: i64,
+    pub table_id: TableId,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub log: Vec<u8>,
+    pub seats: Vec<HandSeatRecord>,
+}
+
+/// Server-side player registry: SQLite-backed records + an online set.
 pub struct Registry {
-    user_dir: PathBuf,
-    /// Monotonically increasing source for new `PlayerId`s. Persisted
-    /// implicitly via the records on disk: on startup we scan and seed
-    /// this above the current maximum.
-    next_id: AtomicU64,
-    /// Currently-connected players keyed by `PlayerId`. The value is
-    /// the username for diagnostics.
-    online: Mutex<HashMap<PlayerId, String>>,
+    pool: SqlitePool,
+    online: Mutex<HashMap<PlayerId, OnlineEntry>>,
 }
 
 impl Registry {
-    /// Open or create a registry rooted at `data_dir`. Scans the
-    /// `users/` subdirectory to seed the next-id counter.
     pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self, RegistryError> {
-        let user_dir = data_dir.as_ref().join("users");
-        fs::create_dir_all(&user_dir).await?;
-
-        let mut max_id: PlayerId = 0;
-        let mut entries = fs::read_dir(&user_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("mp") {
-                continue;
-            }
-            let bytes = match fs::read(&path).await {
-                Ok(b) => b,
-                Err(_) => continue, // ignore unreadable stragglers
-            };
-            if let Ok(rec) = rmp_serde::from_slice::<PlayerRecord>(&bytes) {
-                max_id = max_id.max(rec.player_id);
-            }
-        }
-
+        let dir = data_dir.as_ref();
+        fs::create_dir_all(dir).await?;
+        let pool = db::open_pool(&dir.join("poker.sqlite")).await?;
         Ok(Self {
-            user_dir,
-            next_id: AtomicU64::new(max_id + 1),
+            pool,
             online: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Resolve a username to a [`PlayerRecord`], creating one if this
-    /// is a first-time login. Marks the player as online so a second
-    /// concurrent `Hello` gets [`RegistryError::AlreadyConnected`].
-    pub async fn login(&self, username: &str) -> Result<PlayerRecord, RegistryError> {
+    pub async fn open_in_memory() -> Result<Self, RegistryError> {
+        let pool = db::open_pool_in_memory().await?;
+        Ok(Self {
+            pool,
+            online: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub async fn close(self) {
+        self.pool.close().await;
+    }
+
+    /// Create a new user with a password credential, then issue a
+    /// fresh session. Email and username must both be unused.
+    pub async fn register(
+        &self,
+        email: &str,
+        username: &str,
+        password: &str,
+        device_label: Option<&str>,
+    ) -> Result<AuthSuccess, RegistryError> {
+        if !is_valid_email(email) {
+            return Err(RegistryError::InvalidEmail);
+        }
         if !is_valid_username(username) {
             return Err(RegistryError::InvalidUsername);
         }
+        if !is_valid_password(password) {
+            return Err(RegistryError::InvalidPassword);
+        }
 
-        let record = match self.load_by_username(username).await? {
-            Some(rec) => rec,
-            None => self.create_record(username).await?,
+        let hash = hash_password(password)?;
+        let now = unix_now();
+
+        let mut tx = self.pool.begin().await?;
+
+        let username_taken: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM users WHERE username = ?")
+                .bind(username)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if username_taken.is_some() {
+            return Err(RegistryError::UsernameInUse);
+        }
+        let email_taken: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM users WHERE email = ?")
+                .bind(email)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if email_taken.is_some() {
+            return Err(RegistryError::EmailInUse);
+        }
+
+        let res = sqlx::query("INSERT INTO users (email, username, created_at) VALUES (?, ?, ?)")
+            .bind(email)
+            .bind(username)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        let user_id = res.last_insert_rowid();
+
+        sqlx::query(
+            "INSERT INTO user_password (user_id, password_hash, updated_at) VALUES (?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(&hash)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("INSERT INTO lifetime_stats (user_id) VALUES (?)")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let (session_id, session_key) =
+            issue_session_in_tx(&mut tx, user_id, device_label, now).await?;
+
+        tx.commit().await?;
+
+        let record = PlayerRecord {
+            player_id: user_id as PlayerId,
+            username: username.to_string(),
+            created_unix: now as u64,
+            stats: LifetimeStats::default(),
+        };
+        let revoked = self
+            .install_online(record.player_id, session_id, &record.username)
+            .await;
+        Ok(AuthSuccess {
+            record,
+            session_key,
+            session_id,
+            revoked,
+        })
+    }
+
+    /// Verify a username-or-email + password, then issue a fresh
+    /// session. Revokes any prior live session for that user.
+    pub async fn authenticate_password(
+        &self,
+        identifier: &str,
+        password: &str,
+        device_label: Option<&str>,
+    ) -> Result<AuthSuccess, RegistryError> {
+        let by_email = identifier.contains('@');
+
+        let mut tx = self.pool.begin().await?;
+
+        let row: Option<(i64, String, i64, String)> = if by_email {
+            sqlx::query_as(
+                r#"SELECT u.id, u.username, u.created_at, p.password_hash
+                   FROM users u
+                   JOIN user_password p ON p.user_id = u.id
+                   WHERE u.email = ?"#,
+            )
+            .bind(identifier)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            sqlx::query_as(
+                r#"SELECT u.id, u.username, u.created_at, p.password_hash
+                   FROM users u
+                   JOIN user_password p ON p.user_id = u.id
+                   WHERE u.username = ?"#,
+            )
+            .bind(identifier)
+            .fetch_optional(&mut *tx)
+            .await?
         };
 
-        let mut online = self.online.lock().await;
-        if online.contains_key(&record.player_id) {
-            return Err(RegistryError::AlreadyConnected);
+        let Some((user_id, username, created_at, password_hash)) = row else {
+            return Err(RegistryError::BadCredentials);
+        };
+
+        if !verify_password(password, &password_hash)? {
+            return Err(RegistryError::BadCredentials);
         }
-        online.insert(record.player_id, record.username.clone());
-        Ok(record)
+
+        let now = unix_now();
+        let (session_id, session_key) =
+            issue_session_in_tx(&mut tx, user_id, device_label, now).await?;
+        let stats = load_stats_in_tx(&mut tx, user_id).await?;
+
+        tx.commit().await?;
+
+        let record = PlayerRecord {
+            player_id: user_id as PlayerId,
+            username,
+            created_unix: created_at as u64,
+            stats,
+        };
+        let revoked = self
+            .install_online(record.player_id, session_id, &record.username)
+            .await;
+        Ok(AuthSuccess {
+            record,
+            session_key,
+            session_id,
+            revoked,
+        })
     }
 
-    /// Mark a player offline. Idempotent.
-    pub async fn logout(&self, player_id: PlayerId) {
+    /// Resume an existing live session by key. Does not rotate the
+    /// key; if the key is unknown or revoked the caller gets the
+    /// matching error.
+    pub async fn authenticate_session(&self, key: &str) -> Result<AuthSuccess, RegistryError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(i64, i64, Option<i64>, String, i64)> = sqlx::query_as(
+            r#"SELECT s.id, s.user_id, s.revoked_at, u.username, u.created_at
+               FROM sessions s
+               JOIN users u ON u.id = s.user_id
+               WHERE s.key = ?"#,
+        )
+        .bind(key)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((session_id, user_id, revoked_at, username, created_at)) = row else {
+            return Err(RegistryError::UnknownSession);
+        };
+        if revoked_at.is_some() {
+            return Err(RegistryError::SessionRevoked);
+        }
+
+        let stats = load_stats_in_tx(&mut tx, user_id).await?;
+        tx.commit().await?;
+
+        let record = PlayerRecord {
+            player_id: user_id as PlayerId,
+            username,
+            created_unix: created_at as u64,
+            stats,
+        };
+        let revoked = self
+            .install_online(record.player_id, session_id, &record.username)
+            .await;
+        Ok(AuthSuccess {
+            record,
+            session_key: key.to_string(),
+            session_id,
+            revoked,
+        })
+    }
+
+    /// Mark a player offline IF the entry in the online map still
+    /// belongs to this session — a newer login from another device
+    /// will have replaced the entry and we mustn't kick that one.
+    pub async fn logout(&self, player_id: PlayerId, session_id: i64) {
         let mut online = self.online.lock().await;
-        online.remove(&player_id);
+        if let Some(entry) = online.get(&player_id) {
+            if entry.session_id == session_id {
+                online.remove(&player_id);
+            }
+        }
     }
 
-    /// Snapshot the current online list. Diagnostic helper.
+    /// Snapshot of the currently-online player count. Diagnostic.
     pub async fn online_count(&self) -> usize {
         self.online.lock().await.len()
     }
 
     /// Persist updated lifetime stats for `player_id`. No-op if the
-    /// record file has been removed externally.
+    /// player is no longer online.
     pub async fn update_stats(
         &self,
         player_id: PlayerId,
         stats: LifetimeStats,
     ) -> Result<(), RegistryError> {
-        let username = {
+        {
             let online = self.online.lock().await;
-            online.get(&player_id).cloned()
-        };
-        let Some(username) = username else { return Ok(()) };
-        let mut record = match self.load_by_username(&username).await? {
-            Some(rec) => rec,
-            None => return Ok(()),
-        };
-        record.stats = stats;
-        self.save_record(&record).await
-    }
-
-    fn record_path(&self, username: &str) -> PathBuf {
-        self.user_dir.join(format!("{username}.mp"))
-    }
-
-    async fn load_by_username(
-        &self,
-        username: &str,
-    ) -> Result<Option<PlayerRecord>, RegistryError> {
-        let path = self.record_path(username);
-        let bytes = match fs::read(&path).await {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let record: PlayerRecord = rmp_serde::from_slice(&bytes)?;
-        if record.schema_version != RECORD_SCHEMA_VERSION {
-            return Err(RegistryError::SchemaMismatch {
-                found: record.schema_version,
-                expected: RECORD_SCHEMA_VERSION,
-            });
+            if !online.contains_key(&player_id) {
+                return Ok(());
+            }
         }
-        Ok(Some(record))
-    }
 
-    async fn create_record(&self, username: &str) -> Result<PlayerRecord, RegistryError> {
-        let player_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let created_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let record = PlayerRecord {
-            schema_version: RECORD_SCHEMA_VERSION,
-            player_id,
-            username: username.to_string(),
-            created_unix,
-            stats: LifetimeStats::default(),
-        };
-        self.save_record(&record).await?;
-        Ok(record)
-    }
+        sqlx::query(
+            r#"UPDATE lifetime_stats
+               SET hands = ?, voluntary_pf = ?, raised_pf = ?,
+                   aggressive_actions = ?, passive_actions = ?,
+                   showdowns = ?, chip_delta = ?
+               WHERE user_id = ?"#,
+        )
+        .bind(stats.hands as i64)
+        .bind(stats.voluntary_pf as i64)
+        .bind(stats.raised_pf as i64)
+        .bind(stats.aggressive_actions as i64)
+        .bind(stats.passive_actions as i64)
+        .bind(stats.showdowns as i64)
+        .bind(stats.chip_delta)
+        .bind(player_id as i64)
+        .execute(&self.pool)
+        .await?;
 
-    async fn save_record(&self, record: &PlayerRecord) -> Result<(), RegistryError> {
-        let bytes = rmp_serde::to_vec(record)?;
-        let path = self.record_path(&record.username);
-        // Write to a tempfile and rename so partial writes never leave
-        // a half-baked record on disk.
-        let tmp = path.with_extension("mp.tmp");
-        fs::write(&tmp, &bytes).await?;
-        fs::rename(&tmp, &path).await?;
         Ok(())
     }
+
+    /// Persist one finished hand: a row in `hands` carrying the full
+    /// `FileSink`-compatible event log, plus one row per participating
+    /// seat in `hand_seats`. Returns the inserted `hands.id`.
+    pub async fn record_hand(
+        &self,
+        table_id: TableId,
+        started_at: i64,
+        ended_at: i64,
+        log: Vec<u8>,
+        seats: &[HandSeatRecord],
+    ) -> Result<i64, RegistryError> {
+        let mut tx = self.pool.begin().await?;
+
+        let res = sqlx::query(
+            "INSERT INTO hands (table_id, started_at, ended_at, log) VALUES (?, ?, ?, ?)",
+        )
+        .bind(table_id as i64)
+        .bind(started_at)
+        .bind(ended_at)
+        .bind(log)
+        .execute(&mut *tx)
+        .await?;
+        let hand_id = res.last_insert_rowid();
+
+        for s in seats {
+            sqlx::query(
+                "INSERT INTO hand_seats (hand_id, seat, user_id, chip_delta, sat_out) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(hand_id)
+            .bind(s.seat as i64)
+            .bind(s.player_id.map(|id| id as i64))
+            .bind(s.chip_delta)
+            .bind(s.sat_out as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(hand_id)
+    }
+
+    /// Fetch one persisted hand by id, including its event log and
+    /// per-seat outcome rows. Returns `None` if no hand has that id.
+    pub async fn fetch_hand(&self, id: i64) -> Result<Option<HandRecord>, RegistryError> {
+        let header: Option<(i64, i64, i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT table_id, started_at, ended_at, log FROM hands WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((table_id, started_at, ended_at, log)) = header else {
+            return Ok(None);
+        };
+
+        let rows: Vec<(i64, Option<i64>, i64, i64)> = sqlx::query_as(
+            "SELECT seat, user_id, chip_delta, sat_out FROM hand_seats WHERE hand_id = ? ORDER BY seat",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        let seats = rows
+            .into_iter()
+            .map(|(seat, user_id, chip_delta, sat_out)| HandSeatRecord {
+                seat: seat as SeatIndex,
+                player_id: user_id.map(|v| v as PlayerId),
+                chip_delta: chip_delta as i32,
+                sat_out: sat_out != 0,
+            })
+            .collect();
+        Ok(Some(HandRecord {
+            id,
+            table_id: table_id as TableId,
+            started_at,
+            ended_at,
+            log,
+            seats,
+        }))
+    }
+
+    /// Total number of persisted hands across all tables. Useful for
+    /// tests that need to wait until persistence has caught up.
+    pub async fn count_hands(&self) -> Result<i64, RegistryError> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM hands")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
+    }
+
+    /// Replace the online entry for `player_id`. If a prior entry
+    /// exists, flip its revoke flag so the prior reader loop tears
+    /// itself down on its next iteration.
+    async fn install_online(
+        &self,
+        player_id: PlayerId,
+        session_id: i64,
+        username: &str,
+    ) -> Arc<AtomicBool> {
+        let revoked = Arc::new(AtomicBool::new(false));
+        let mut online = self.online.lock().await;
+        if let Some(prev) = online.insert(
+            player_id,
+            OnlineEntry {
+                session_id,
+                revoked: revoked.clone(),
+                username: username.to_string(),
+            },
+        ) {
+            prev.revoked.store(true, Ordering::SeqCst);
+        }
+        revoked
+    }
+}
+
+async fn issue_session_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: i64,
+    device_label: Option<&str>,
+    now: i64,
+) -> Result<(i64, String), RegistryError> {
+    // Revoke any currently-live sessions for this user.
+    sqlx::query(
+        "UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+    )
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+
+    let key = new_session_key();
+    let res = sqlx::query(
+        "INSERT INTO sessions (user_id, key, device_label, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(&key)
+    .bind(device_label)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok((res.last_insert_rowid(), key))
+}
+
+async fn load_stats_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: i64,
+) -> Result<LifetimeStats, RegistryError> {
+    let row: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        r#"SELECT hands, voluntary_pf, raised_pf, aggressive_actions,
+                  passive_actions, showdowns, chip_delta
+           FROM lifetime_stats WHERE user_id = ?"#,
+    )
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(LifetimeStats {
+        hands: row.0 as u64,
+        voluntary_pf: row.1 as u64,
+        raised_pf: row.2 as u64,
+        aggressive_actions: row.3 as u64,
+        passive_actions: row.4 as u64,
+        showdowns: row.5 as u64,
+        chip_delta: row.6,
+    })
+}
+
+fn hash_password(password: &str) -> Result<String, RegistryError> {
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)?
+        .to_string();
+    Ok(hash)
+}
+
+fn verify_password(password: &str, hash: &str) -> Result<bool, RegistryError> {
+    let parsed = PasswordHash::new(hash)?;
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
+}
+
+fn new_session_key() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(64);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -203,69 +598,185 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    const PW: &str = "hunter2hunter";
+
     #[tokio::test]
-    async fn login_creates_record_then_returns_same_id() {
-        let dir = tempdir().unwrap();
-        let reg = Registry::open(dir.path()).await.unwrap();
+    async fn register_then_authenticate_password_returns_same_id() {
+        let reg = Registry::open_in_memory().await.unwrap();
 
-        let rec1 = reg.login("alice").await.unwrap();
-        assert_eq!(rec1.username, "alice");
-        assert_eq!(rec1.stats.hands, 0);
-        let id = rec1.player_id;
+        let r1 = reg
+            .register("alice@example.com", "alice", PW, None)
+            .await
+            .unwrap();
+        let id = r1.record.player_id;
+        assert_eq!(r1.record.username, "alice");
+        assert!(!r1.session_key.is_empty());
 
-        reg.logout(id).await;
+        // logout to clear the online flag, then re-auth.
+        reg.logout(id, r1.session_id).await;
 
-        let rec2 = reg.login("alice").await.unwrap();
-        assert_eq!(rec2.player_id, id);
+        let r2 = reg
+            .authenticate_password("alice", PW, None)
+            .await
+            .unwrap();
+        assert_eq!(r2.record.player_id, id);
+        assert_ne!(r2.session_key, r1.session_key, "new session each auth");
     }
 
     #[tokio::test]
-    async fn second_concurrent_login_rejects() {
-        let dir = tempdir().unwrap();
-        let reg = Registry::open(dir.path()).await.unwrap();
+    async fn authenticate_by_email_works() {
+        let reg = Registry::open_in_memory().await.unwrap();
+        let r1 = reg
+            .register("alice@example.com", "alice", PW, None)
+            .await
+            .unwrap();
+        reg.logout(r1.record.player_id, r1.session_id).await;
 
-        let _ = reg.login("alice").await.unwrap();
-        let err = reg.login("alice").await.unwrap_err();
-        assert!(matches!(err, RegistryError::AlreadyConnected));
+        let r2 = reg
+            .authenticate_password("alice@example.com", PW, None)
+            .await
+            .unwrap();
+        assert_eq!(r2.record.player_id, r1.record.player_id);
     }
 
     #[tokio::test]
-    async fn invalid_username_rejected() {
-        let dir = tempdir().unwrap();
-        let reg = Registry::open(dir.path()).await.unwrap();
-        let err = reg.login("x").await.unwrap_err();
+    async fn wrong_password_rejects() {
+        let reg = Registry::open_in_memory().await.unwrap();
+        reg.register("a@b.co", "alice", PW, None).await.unwrap();
+        let err = reg
+            .authenticate_password("alice", "wrongpassword", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::BadCredentials));
+    }
+
+    #[tokio::test]
+    async fn unknown_user_rejects_with_bad_credentials() {
+        let reg = Registry::open_in_memory().await.unwrap();
+        let err = reg
+            .authenticate_password("nobody", PW, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::BadCredentials));
+    }
+
+    #[tokio::test]
+    async fn duplicate_username_rejects() {
+        let reg = Registry::open_in_memory().await.unwrap();
+        reg.register("a@b.co", "alice", PW, None).await.unwrap();
+        let err = reg
+            .register("c@d.co", "alice", PW, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::UsernameInUse));
+    }
+
+    #[tokio::test]
+    async fn duplicate_email_rejects() {
+        let reg = Registry::open_in_memory().await.unwrap();
+        reg.register("a@b.co", "alice", PW, None).await.unwrap();
+        let err = reg
+            .register("a@b.co", "bob", PW, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::EmailInUse));
+    }
+
+    #[tokio::test]
+    async fn session_resume_works_until_replaced() {
+        let reg = Registry::open_in_memory().await.unwrap();
+        let r1 = reg.register("a@b.co", "alice", PW, None).await.unwrap();
+        let key = r1.session_key.clone();
+        reg.logout(r1.record.player_id, r1.session_id).await;
+
+        let resumed = reg.authenticate_session(&key).await.unwrap();
+        assert_eq!(resumed.record.player_id, r1.record.player_id);
+        reg.logout(resumed.record.player_id, resumed.session_id).await;
+
+        // Password auth issues a new session and revokes the old one.
+        let _r2 = reg.authenticate_password("alice", PW, None).await.unwrap();
+
+        // The original key is now revoked.
+        let err = reg.authenticate_session(&key).await.unwrap_err();
+        assert!(matches!(err, RegistryError::SessionRevoked));
+    }
+
+    #[tokio::test]
+    async fn new_login_kicks_prior_online_session() {
+        let reg = Registry::open_in_memory().await.unwrap();
+        let r1 = reg.register("a@b.co", "alice", PW, None).await.unwrap();
+        let prior_revoked = r1.revoked.clone();
+
+        let r2 = reg
+            .authenticate_password("alice", PW, None)
+            .await
+            .unwrap();
+
+        assert!(prior_revoked.load(Ordering::SeqCst));
+        assert!(!r2.revoked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn invalid_email_rejects() {
+        let reg = Registry::open_in_memory().await.unwrap();
+        let err = reg
+            .register("not-an-email", "alice", PW, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::InvalidEmail));
+    }
+
+    #[tokio::test]
+    async fn invalid_username_rejects() {
+        let reg = Registry::open_in_memory().await.unwrap();
+        let err = reg
+            .register("a@b.co", "x", PW, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, RegistryError::InvalidUsername));
     }
 
     #[tokio::test]
-    async fn ids_persist_and_advance_across_reopen() {
+    async fn short_password_rejects() {
+        let reg = Registry::open_in_memory().await.unwrap();
+        let err = reg
+            .register("a@b.co", "alice", "short", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::InvalidPassword));
+    }
+
+    #[tokio::test]
+    async fn ids_persist_across_reopen() {
         let dir = tempdir().unwrap();
 
         let reg = Registry::open(dir.path()).await.unwrap();
-        let a = reg.login("alice").await.unwrap();
-        let b = reg.login("bob").await.unwrap();
-        assert_ne!(a.player_id, b.player_id);
-        drop(reg);
+        let r1 = reg.register("a@b.co", "alice", PW, None).await.unwrap();
+        let id = r1.record.player_id;
+        reg.close().await;
 
         let reg = Registry::open(dir.path()).await.unwrap();
-        let c = reg.login("carol").await.unwrap();
-        assert!(c.player_id > a.player_id.max(b.player_id));
+        let r2 = reg.authenticate_password("alice", PW, None).await.unwrap();
+        assert_eq!(r2.record.player_id, id);
+        reg.close().await;
     }
 
     #[tokio::test]
     async fn update_stats_persists() {
-        let dir = tempdir().unwrap();
-        let reg = Registry::open(dir.path()).await.unwrap();
-        let rec = reg.login("alice").await.unwrap();
+        let reg = Registry::open_in_memory().await.unwrap();
+        let r = reg.register("a@b.co", "alice", PW, None).await.unwrap();
 
-        let mut new_stats = LifetimeStats::default();
-        new_stats.hands = 100;
-        new_stats.chip_delta = -42;
-        reg.update_stats(rec.player_id, new_stats).await.unwrap();
+        let new_stats = LifetimeStats {
+            hands: 100,
+            chip_delta: -42,
+            ..LifetimeStats::default()
+        };
+        reg.update_stats(r.record.player_id, new_stats).await.unwrap();
 
-        reg.logout(rec.player_id).await;
-        let rec2 = reg.login("alice").await.unwrap();
-        assert_eq!(rec2.stats.hands, 100);
-        assert_eq!(rec2.stats.chip_delta, -42);
+        // Stats survive a logout / re-auth cycle.
+        reg.logout(r.record.player_id, r.session_id).await;
+        let r2 = reg.authenticate_password("alice", PW, None).await.unwrap();
+        assert_eq!(r2.record.stats.hands, 100);
+        assert_eq!(r2.record.stats.chip_delta, -42);
     }
 }

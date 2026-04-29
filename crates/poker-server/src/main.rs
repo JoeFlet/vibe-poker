@@ -82,11 +82,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     let rules = BettingRules::no_limit_holdem(cfg.small_blind, cfg.big_blind, cfg.max_seats as usize);
     let table = Table::new(1, cfg);
-    tables.install(table, rules).await;
+    tables.install(table, rules, Arc::clone(&registry)).await;
 
     let ctx = ServerContext {
         registry,
         tables: tables.clone(),
+        limits: Default::default(),
     };
 
     let listener = TcpListener::bind(&cli.bind).await?;
