@@ -336,6 +336,66 @@ mod tests {
         assert!(!is_valid_password(&"x".repeat(129)));     // > 128
     }
 
+    /// Wire-format invariants the long-form `PROTOCOL.md` relies on.
+    /// If anyone ever switches `rmp_serde::to_vec` for the named-map
+    /// variant (`to_vec_named`) this test fails loudly — silently
+    /// flipping the format would break every client built against the
+    /// spec.
+    #[test]
+    fn structs_serialize_as_positional_arrays_not_maps() {
+        // Welcome with 5 fields → outer 1-entry map (variant tag) +
+        // inner fixarray of 5. Critically: no field-name strings on
+        // the wire (which is what the named-map variant would emit).
+        let bytes = rmp_serde::to_vec(&ServerMessage::Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            player_id: 1,
+            username: "alice".into(),
+            session_key: "k".into(),
+            stats: LifetimeStats::default(),
+        })
+        .unwrap();
+        // 0x81 = fixmap with 1 entry (the {"Welcome": …} envelope)
+        // 0xa7 0x57 0x65 ... = fixstr len 7 "Welcome"
+        // 0x95 = fixarray with 5 elements (the struct fields)
+        let expected_prefix = [
+            0x81, 0xa7, b'W', b'e', b'l', b'c', b'o', b'm', b'e', 0x95,
+        ];
+        assert_eq!(
+            &bytes[..expected_prefix.len()],
+            &expected_prefix,
+            "Welcome must serialize as {{\"Welcome\": [<5-array>]}} \
+             (positional fields, no field names on the wire)",
+        );
+        // Sanity: no field name from the struct should appear as a
+        // bare string in the payload — that would mean someone
+        // switched to `to_vec_named`.
+        let payload = String::from_utf8_lossy(&bytes);
+        for forbidden in ["protocol_version", "player_id", "session_key"] {
+            assert!(
+                !payload.contains(forbidden),
+                "field name {forbidden:?} leaked into wire bytes — \
+                 has someone switched the encoder to named maps?",
+            );
+        }
+    }
+
+    /// Single-field tuple variants (`Action::Raise(u32)`) are encoded
+    /// as `{"Raise": <u32>}` — the inner value is bare, not wrapped
+    /// in a 1-element array. PROTOCOL.md documents this shape.
+    #[test]
+    fn newtype_variant_inner_is_not_array_wrapped() {
+        use crate::game::Action;
+        let bytes = rmp_serde::to_vec(&Action::Raise(50)).unwrap();
+        // 0x81 fixmap-1, 0xa5 "Raise", 0x32 positive fixint 50.
+        // If the inner had been wrapped in [50] we'd see 0x91 (fixarray-1)
+        // before the 0x32.
+        assert_eq!(
+            bytes,
+            [0x81, 0xa5, b'R', b'a', b'i', b's', b'e', 0x32],
+            "Raise(50) must be {{\"Raise\": 50}}, not {{\"Raise\": [50]}}",
+        );
+    }
+
     #[test]
     fn message_roundtrip() {
         let auth = ClientMessage::Authenticate {

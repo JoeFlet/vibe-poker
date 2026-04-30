@@ -1,6 +1,6 @@
 # poker
 
-A Cargo workspace for a high-performance Texas Hold'em **rules engine**, an **agent trainer** built on top, and a **TCP poker server** that lets remote clients play hands. An `egui` reference client is shipped alongside as a smoke-testing harness; the next-generation playable client is being developed in a separate repository and is planned to land here later as a git submodule.
+A Cargo workspace for a high-performance Texas Hold'em **rules engine**, an **agent trainer** built on top, and a **TCP poker server** that lets remote clients play hands. The playable client is split between in-tree Rust crates (state machine + transport + headless test harness) and a SolidJS / Tauri 2 frontend shell hosted in the `client/` git submodule. Architectural principles for the client live at [docs/CLIENT_PRINCIPLES.md](docs/CLIENT_PRINCIPLES.md).
 
 ## The four pieces
 
@@ -8,8 +8,12 @@ A Cargo workspace for a high-performance Texas Hold'em **rules engine**, an **ag
 |---|---|---|
 | [crates/poker-engine](crates/poker-engine/) | Pure-Rust rules library: cards, evaluator, game state, betting, agents, sim, stats, wire types | Stable |
 | [crates/poker-trainer](crates/poker-trainer/) | MCCFR solver, dataset aggregator, `poker_train` / `poker_play` / `poker_dataset` CLIs | Stable |
-| [crates/poker-server](crates/poker-server/) | Async TCP server wrapping `Engine::run_hand` for live play | **Active focus** |
-| [crates/poker-client](crates/poker-client/) | `egui` replay viewer + reference live client | Deprecated; in-tree as a smoke-test harness, frozen at `PROTOCOL_VERSION = 3`. Real client is a sibling repo (planned submodule). |
+| [crates/poker-server](crates/poker-server/) | Async TCP server wrapping `Engine::run_hand` for live play | Stable |
+| [crates/poker-client](crates/poker-client/) | `egui` replay viewer + reference live client | Deprecated; frozen at `PROTOCOL_VERSION = 3` as a smoke-test harness only. Removed when v4 lands. |
+| [crates/poker-client-core](crates/poker-client-core/) | Pure synchronous client state machine (Intent → Effect, no I/O) | **Active focus** (step 25a) |
+| [crates/poker-client-transport-native](crates/poker-client-transport-native/) | Tokio TCP transport + native session-key persistence | Active (step 25b) |
+| [crates/poker-client-headless](crates/poker-client-headless/) | Test-friendly client harness used by workspace-root full-flow tests | Active (step 25c) |
+| [client/](client/) (submodule) | Tauri 2 + SolidJS + Vite + TS shell | Active (step 25d) |
 
 Each crate has its own README with the specifics. The rest of this document is the cross-cutting view — how the pieces fit together, what contracts they share, and how to drive the workspace from end to end.
 
@@ -112,8 +116,14 @@ Step plan and status live in [DESIGN.md](DESIGN.md). At a glance:
 | 22c (reconnect mid-hand) | ✅ |
 | 23 (`PROTOCOL.md` long-form spec) | ✅ |
 | 24 (deprecate `poker-client` and refocus docs) | ✅ |
+| 25a (`poker-client-core` state machine) | 🔲 Active |
+| 25b (`poker-client-transport-native`) | 🔲 |
+| 25c (`poker-client-headless` + workspace-root full-flow tests) | 🔲 |
+| 25d (Tauri 2 + SolidJS shell in `client/`) | 🔲 |
+| 26 (server-side hand replay verb, protocol v4) | 🔲 |
+| 27 (mid-hand persistence atomicity, regression test) | 🔲 |
 
-Steps 1–24 cover everything originally planned for the in-tree workspace. Future work — most prominently importing the sibling client repo as a submodule and any post-launch server hardening — will be appended as new steps when the time comes.
+Phase 1 (steps 1–24) is the in-tree workspace foundation. Phase 2 (steps 25–27) is the Rust client rewrite, kicked off 2026-04-29 after the Flutter prototype was retired (its lessons-learned post-mortem is in [docs/CLIENT_PRINCIPLES.md](docs/CLIENT_PRINCIPLES.md)).
 
 ## Tests
 

@@ -2290,6 +2290,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "poker-client-core"
+version = "0.1.0"
+dependencies = [
+ "poker_engine",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "poker-client-headless"
+version = "0.1.0"
+dependencies = [
+ "poker-client-core",
+ "poker-server",
+ "poker_engine",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "poker-client-transport-native"
+version = "0.1.0"
+dependencies = [
+ "poker-client-core",
+ "poker_engine",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "poker-full-flow-tests"
+version = "0.1.0"
+dependencies = [
+ "poker-client-core",
+ "poker-client-headless",
+ "poker-server",
+ "poker_engine",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "poker-server"
 version = "0.1.0"
 dependencies = [

@@ -865,7 +865,77 @@ serving as the schema source of truth.
     interop). Until then, references to "the client" in this repo
     mean the deprecated in-tree harness.
 
-This concludes the originally-planned step list. Future work — the
-sibling-client submodule import, post-launch server hardening,
-operational tooling — will be appended as new numbered steps when
-it's planned in detail.
+This concludes the originally-planned step list. Steps 25+ below
+were added 2026-04-29 after a project-direction shift on the client
+side.
+
+## Phase 2 — Rust client rewrite + supporting server work
+
+Decided 2026-04-29: the Flutter client experiment in the
+`ssh://joscode.com/home/joseph/git/poker-client` repo is being
+treated as a failed experiment (intertwined UI + state logic, poor
+framework fit, bug-prone, slow progress). Lessons learned applied
+to a new architecture: **Rust state machine core + transport layer
++ headless test harness in-tree**, **SolidJS / Tauri 2 shell**
+back in the `client/` submodule (which gets force-reset; the old
+state lives on as the `flutter-experiment` tag in that repo).
+
+The three load-bearing principles that shape this phase live at
+[docs/CLIENT_PRINCIPLES.md](docs/CLIENT_PRINCIPLES.md): strict
+correctness with full-flow tests, thin UI projecting state, and
+resilience to interruption via server-driven resync.
+
+28. **Step 25 — Client architecture rewrite.** Multi-crate setup:
+    - **25a — `poker-client-core`.** Pure synchronous state machine.
+      Inputs: `Intent` (user actions) + inbound `ServerMessage`.
+      Outputs: `Effect` stream (`Send`, `PersistSessionKey`,
+      `OpenConnection`, `Log`, …) and a queryable `ClientView`
+      projection. No `tokio`, no I/O, no platform code. Depends only
+      on `poker-engine` for wire types. Every state transition unit-
+      tested.
+    - **25b — `poker-client-transport-native`.** Tokio TCP transport
+      + filesystem session-key persistence. Owns the socket pump,
+      forwards inbound `ServerMessage`s into the core, processes the
+      core's outbound `Effect` stream. Implements a small `Transport`
+      trait so a future `poker-client-transport-browser` (wasm +
+      WebSockets + IndexedDB) can slot in.
+    - **25c — `poker-client-headless`.** Test-friendly harness: an
+      in-memory transport pair, a driver that consumes a scripted
+      `Vec<Intent>` and yields a sequence of `ClientView` snapshots,
+      a small CLI binary for ad-hoc reproduction. Used by the
+      workspace-root full-flow tests at `tests/` to drive end-to-end
+      scenarios against an in-process `poker-server`.
+    - **25d — `client/` Tauri shell.** After the existing repo's
+      `main` is reset (with the prior state preserved as the
+      `flutter-experiment` tag), the submodule is re-initialised
+      as a Tauri 2 + SolidJS + Vite + TypeScript app, package-
+      managed by pnpm. Its Rust glue depends on
+      `poker-client-core` + `poker-client-transport-native`; its
+      job is forwarding intents from the frontend to the core,
+      pumping effects, and exposing `snapshot()` over Tauri commands.
+
+29. **Step 26 — Server-side hand replay (protocol v4).** Required by
+    principle 3. The server gets a new client verb, working title
+    `RequestReplay { hand_id }`, that replies with the full ordered
+    `EngineEvent` stream for the in-flight hand as the requesting
+    seat would have seen it (their hole cards visible, others
+    masked). Bumps `PROTOCOL_VERSION` to 4 and invalidates v3
+    clients; the in-tree deprecated `crates/poker-client` doesn't
+    get updated — it's a v3 harness for the server's v3 codepath
+    until that codepath is removed. PROTOCOL.md gets a new
+    sub-section under §6 covering the verb's preconditions
+    (recipient must be seated at the named hand), guarantees
+    (events are byte-identical to what the seat originally received),
+    and ordering relative to subsequent live broadcasts.
+
+30. **Step 27 — Mid-hand persistence atomicity.** Verify and document
+    that `Registry::record_hand` only fires at `HandEnded`, that no
+    chip movement is reflected in `lifetime_stats` or `hands` /
+    `hand_seats` until then, and that a server restart mid-hand
+    leaves the database in a state indistinguishable from "the hand
+    never started." Add a stress test that crashes the server-task
+    mid-hand and asserts no SQLite mutation occurred. Likely a
+    documentation-only step (the current implementation already
+    holds the invariant), but pinned with a regression test so a
+    future "incremental stat update" optimisation can't silently
+    break it.

@@ -34,10 +34,19 @@ A real-world payload is typically tens to hundreds of bytes; the cap exists pure
 
 ### 1.3 Encoding rules
 
-- Rust enums serialize as msgpack maps with a single key — the variant name — and a value carrying that variant's payload (the default `serde_derive` behaviour). Tuple variants (`Action::Raise(u32)`) serialize as a single-element array. Unit variants (`Action::Fold`) serialize as the bare string `"Fold"`.
-- Optional fields (`device_label: Option<String>`) serialize as `nil` when absent.
-- `Card` is a single byte 0–51: `(rank << 2) | suit`. Rank 0 = Two, …, 12 = Ace; suit 0 = Clubs, 1 = Diamonds, 2 = Hearts, 3 = Spades.
-- Chip amounts are unsigned 32-bit big-blind-denominated integers. There are no floats anywhere in the protocol. `chip_delta` (signed 32-bit) is the only signed chip field.
+The wire format is the **compact** (default) `rmp-serde` encoding — `to_vec`, **not** `to_vec_named`. Concretely:
+
+- **Structs and struct-variant payloads** serialize as **positional msgpack arrays of field values in declaration order**. There are no field-name strings on the wire. For example, `LifetimeStats { hands, voluntary_pf, raised_pf, aggressive_actions, passive_actions, showdowns, chip_delta }` is a 7-element array `[u64, u64, u64, u64, u64, u64, i64]`.
+- **Enum variants** are encoded by variant name:
+  - **Unit variants** (`Action::Fold`, `ClientMessage::Heartbeat`): the **bare string** `"Fold"` / `"Heartbeat"`.
+  - **Struct variants** (`ServerMessage::Welcome { … }`, `EngineEvent::HandStarted { … }`, …): a single-key map `{"VariantName": [<positional fields>]}` where the inner array is the struct payload encoded by the rule above.
+  - **Newtype tuple variants** with exactly one field (`Action::Raise(u32)`, `AuthMode::Session { key }` is *not* this — it's a struct variant): a single-key map `{"VariantName": <inner-value>}`. The inner value is **not** wrapped in a 1-element array.
+  - **Tuple variants with ≥ 2 fields**: a single-key map `{"VariantName": [<fields>]}`.
+- **Optional fields** (`device_label: Option<String>`) serialize as `nil` when absent and as the bare value when present.
+- **`Card`** is a single byte 0–51: `(rank << 2) | suit`. Rank 0 = Two, …, 12 = Ace; suit 0 = Clubs, 1 = Diamonds, 2 = Hearts, 3 = Spades.
+- **Chip amounts** are unsigned 32-bit big-blind-denominated integers. There are no floats anywhere in the protocol. `chip_delta` (signed 32-bit) is the only signed chip field.
+
+> **Concrete example.** `ServerMessage::Welcome { protocol_version: 3, player_id: 1, username: "alice", session_key: "k", stats: LifetimeStats::default() }` encodes as the 28-byte sequence `81 a7 'Welcome' 95 03 01 a5 'alice' a1 'k' 97 00 00 00 00 00 00 00`: a one-key map (`81`) with key `"Welcome"`, whose value is a 5-element fixarray (`95`) holding the five struct fields, the last of which is itself a 7-element fixarray (`97`) for `LifetimeStats`. **No field-name strings appear on the wire.** A non-Rust client must decode by position, not by name. The invariant is pinned by `structs_serialize_as_positional_arrays_not_maps` in [`protocol.rs`](protocol.rs).
 
 ---
 
@@ -431,33 +440,33 @@ Only one live session per user. A second successful `Authenticate` (in any mode)
 
 ## 8. msgpack schema appendix
 
-Field-by-field msgpack shape for every message variant. Types use the JSON-ish notation `string`, `u32`, `[T]`, `(T)` (single-element array for tuple variants), and `null | T` for optional.
+Field-by-field msgpack shape for every message variant.
 
-> The encoding follows `serde_derive`'s default for `rmp-serde`: structs serialize as fixed-key maps in field-declaration order; enums serialize as a single-key map `{"VariantName": <payload>}` (or the bare string `"VariantName"` for unit variants).
+> **Reading the notation.** Per § 1.3, structs and struct-variant payloads are positional arrays. Each entry below uses `[…]` to mean a msgpack array whose elements are the struct's fields in declaration order — **never** a map keyed by field name. Comments after `//` annotate which struct field each position corresponds to but do **not** appear on the wire. `null | T` denotes a serde `Option<T>` (nil when absent). `<TypeName>` references a named shape defined elsewhere in this appendix.
 
 ### 8.1 `ClientMessage`
 
 ```
-{"Register": {
-    "protocol_version": u32,
-    "email": string,
-    "username": string,
-    "password": string,
-    "device_label": null | string,
-}}
-{"Authenticate": {
-    "protocol_version": u32,
-    "mode": <AuthMode>,
-    "device_label": null | string,
-}}
+{"Register":     [ u32,            // protocol_version
+                   string,         // email
+                   string,         // username
+                   string,         // password
+                   null | string ] // device_label
+}
+{"Authenticate": [ u32,            // protocol_version
+                   <AuthMode>,     // mode
+                   null | string ] // device_label
+}
 "ListTables"
-{"JoinTable": { "table_id": u32, "buy_in": u32 }}
-{"LeaveTable": { "table_id": u32 }}
-{"SubmitAction": {
-    "table_id": u32,
-    "hand_id": u64,
-    "action": <Action>,
-}}
+{"JoinTable":    [ u32,            // table_id
+                   u32 ]           // buy_in
+}
+{"LeaveTable":   [ u32 ]           // table_id
+}
+{"SubmitAction": [ u32,            // table_id
+                   u64,            // hand_id
+                   <Action> ]      // action
+}
 "Heartbeat"
 "Disconnect"
 ```
@@ -465,91 +474,134 @@ Field-by-field msgpack shape for every message variant. Types use the JSON-ish n
 #### `AuthMode`
 
 ```
-{"Password": { "identifier": string, "password": string }}
-{"Session":  { "key": string }}
+{"Password": [ string,             // identifier (username or email)
+               string ]            // password
+}
+{"Session":  [ string ]            // key
+}
 ```
 
 #### `Action`
 
 ```
 "Fold" | "Check" | "Call" | "AllIn"
-{"Raise": [ u32 ]}
+{"Raise": u32}                      // bare u32 — NOT [u32]
 ```
+
+`Raise` is a Rust newtype-style tuple variant (`Action::Raise(u32)`). The inner `u32` is **not** wrapped in a 1-element array.
 
 ### 8.2 `ServerMessage`
 
 ```
-{"Welcome": {
-    "protocol_version": u32,
-    "player_id": u64,
-    "username": string,
-    "session_key": string,
-    "stats": <LifetimeStats>,
-}}
-{"Rejected": { "protocol_version": u32, "reason": string }}
-{"TableList": { "tables": [<TableInfo>] }}
-{"JoinedTable": {
-    "table_id": u32,
-    "seat": uint,
-    "seats": [<SeatInfo>],
-}}
-{"LeftTable": { "table_id": u32 }}
-{"TableEvent": { "table_id": u32, "event": <EngineEvent> }}
-{"TableState": {
-    "table_id": u32,
-    "seats": [<SeatInfo>],
-    "button": uint,
-}}
-{"Prompt": {
-    "table_id": u32,
-    "hand_id": u64,
-    "seat": uint,
-    "legal": <LegalActions>,
-    "deadline_ms": u32,
-}}
-{"ActionRejected": { "reason": string }}
+{"Welcome":        [ u32,                  // protocol_version
+                     u64,                  // player_id
+                     string,               // username
+                     string,               // session_key
+                     <LifetimeStats> ]     // stats
+}
+{"Rejected":       [ u32,                  // protocol_version
+                     string ]              // reason
+}
+{"TableList":      [ [<TableInfo>] ]       // tables
+}
+{"JoinedTable":    [ u32,                  // table_id
+                     uint,                 // seat (SeatIndex; usize on the wire — see § 1.3)
+                     [<SeatInfo>] ]        // seats
+}
+{"LeftTable":      [ u32 ]                 // table_id
+}
+{"TableEvent":     [ u32,                  // table_id
+                     <EngineEvent> ]       // event
+}
+{"TableState":     [ u32,                  // table_id
+                     [<SeatInfo>],         // seats
+                     uint ]                // button (SeatIndex)
+}
+{"Prompt":         [ u32,                  // table_id
+                     u64,                  // hand_id
+                     uint,                 // seat
+                     <LegalActions>,       // legal
+                     u32 ]                 // deadline_ms
+}
+{"ActionRejected": [ string ]              // reason
+}
 "Heartbeat"
-{"Goodbye": { "reason": string }}
+{"Goodbye":        [ string ]              // reason
+}
 ```
 
 #### `TableInfo`, `SeatInfo`, `LifetimeStats`, `LegalActions`
 
 ```
-TableInfo {
-    "table_id": u32, "name": string,
-    "small_blind": u32, "big_blind": u32,
-    "max_seats": u8, "seated": u8, "default_buy_in": u32,
-}
-SeatInfo { "seat": uint, "player_id": u64, "username": string, "stack": u32 }
-LifetimeStats {
-    "hands": u64, "voluntary_pf": u64, "raised_pf": u64,
-    "aggressive_actions": u64, "passive_actions": u64,
-    "showdowns": u64, "chip_delta": i64,
-}
-LegalActions {
-    "can_check": bool, "can_call": bool, "call_amount": u32,
-    "can_raise": bool, "min_raise": u32, "max_raise": u32,
-    "all_in_amount": u32,
-}
+TableInfo:
+  [ u32,    // table_id
+    string, // name
+    u32,    // small_blind
+    u32,    // big_blind
+    u8,     // max_seats
+    u8,     // seated
+    u32 ]   // default_buy_in
+
+SeatInfo:
+  [ uint,   // seat
+    u64,    // player_id
+    string, // username
+    u32 ]   // stack
+
+LifetimeStats:
+  [ u64,    // hands
+    u64,    // voluntary_pf
+    u64,    // raised_pf
+    u64,    // aggressive_actions
+    u64,    // passive_actions
+    u64,    // showdowns
+    i64 ]   // chip_delta
+
+LegalActions:
+  [ bool,   // can_check
+    bool,   // can_call
+    u32,    // call_amount
+    bool,   // can_raise
+    u32,    // min_raise
+    u32,    // max_raise
+    u32 ]   // all_in_amount
 ```
 
 #### `EngineEvent`
 
 ```
-{"HandStarted":    { "hand_id": u64, "dealer": uint, "deck_seed": u64 }}
-{"HoleCardsDealt": { "seat": uint, "cards": [u8, u8] }}
-{"BoardDealt":     { "street": <Street>, "cards": [u8] }}
-{"ActionTaken":    { "seat": uint, "action": <Action>, "pot_total": u32 }}
-{"PlayerAllIn":    { "seat": uint, "total_committed": u32 }}
-{"HandEnded":      { "hand_id": u64, "result": <HandResult> }}
-
-HandResult { "hand_id": u64, "board": [u8], "seats": [<SeatOutcome>] }
-SeatOutcome {
-    "seat": uint,
-    "hole_cards": null | [u8, u8],
-    "chip_delta": i32,
-    "sat_out": bool,                  // optional; defaults false
+{"HandStarted":    [ u64,             // hand_id
+                     uint,            // dealer
+                     u64 ]            // deck_seed
 }
+{"HoleCardsDealt": [ uint,            // seat
+                     [u8, u8] ]       // cards (fixed-2 array of Card bytes)
+}
+{"BoardDealt":     [ <Street>,        // street
+                     [u8] ]           // cards (variable-length Card bytes)
+}
+{"ActionTaken":    [ uint,            // seat
+                     <Action>,        // action
+                     u32 ]            // pot_total
+}
+{"PlayerAllIn":    [ uint,            // seat
+                     u32 ]            // total_committed
+}
+{"HandEnded":      [ u64,             // hand_id
+                     <HandResult> ]   // result
+}
+
+HandResult:
+  [ u64,                              // hand_id
+    [u8],                             // board (Card bytes)
+    [<SeatOutcome>] ]                 // seats
+
+SeatOutcome:
+  [ uint,                             // seat
+    null | [u8, u8],                  // hole_cards
+    i32,                              // chip_delta
+    bool ]                            // sat_out (optional in serde, but always
+                                      //         emitted by the server)
 
 Street ::= "Preflop" | "Flop" | "Turn" | "River" | "Showdown"
 ```

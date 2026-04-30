@@ -1,0 +1,16 @@
+[package]
+name = "poker-client-transport-native"
+version = "0.1.0"
+edition = "2024"
+
+# Native transport for poker-client-core. Step 25b per DESIGN.md.
+# Owns the tokio TCP socket, framing, session-key persistence on
+# the local filesystem, and the inbound/outbound pump loop.
+
+[dependencies]
+poker_engine = { path = "../poker-engine" }
+poker-client-core = { path = "../poker-client-core" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tracing = "0.1"
+thiserror = "1"

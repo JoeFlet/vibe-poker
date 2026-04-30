@@ -1,0 +1,4 @@
+[submodule "client"]
+	path = client
+	url = ssh://joscode.com/home/joseph/git/poker-client
+	branch = main

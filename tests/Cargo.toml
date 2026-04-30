@@ -1,0 +1,29 @@
+[package]
+name = "poker-full-flow-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Workspace-root integration tests that cross crate boundaries (typically poker-server in-process driven by poker-client-headless)."
+
+# This crate exists only to host the integration tests in `tests/`.
+# The lib is intentionally empty.
+
+[lib]
+path = "src/lib.rs"
+
+# Harness deps live in [dependencies] (not [dev-dependencies]) because
+# the harness IS in the lib — every integration test under tests/
+# imports it. The crate is publish=false; runtime deps don't matter.
+
+[dependencies]
+poker_engine = { path = "../crates/poker-engine" }
+poker-server = { path = "../crates/poker-server" }
+poker-client-core = { path = "../crates/poker-client-core" }
+poker-client-headless = { path = "../crates/poker-client-headless" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tempfile = "3"
+
+[dev-dependencies]
+tracing = "0.1"
+tracing-subscriber = "0.3"

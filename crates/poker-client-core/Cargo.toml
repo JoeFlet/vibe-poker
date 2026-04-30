@@ -1,0 +1,12 @@
+[package]
+name = "poker-client-core"
+version = "0.1.0"
+edition = "2024"
+
+# Pure synchronous client state machine. Step 25a per DESIGN.md.
+# Depends ONLY on poker_engine for wire types — no tokio, no I/O,
+# no platform code. See ../../docs/CLIENT_PRINCIPLES.md.
+
+[dependencies]
+poker_engine = { path = "../poker-engine" }
+thiserror = "1"

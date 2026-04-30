@@ -5,4 +5,10 @@ members = [
     "crates/poker-trainer",
     "crates/poker-client",
     "crates/poker-server",
+    # Phase 2 — client rewrite (DESIGN.md step 25)
+    "crates/poker-client-core",
+    "crates/poker-client-transport-native",
+    "crates/poker-client-headless",
+    # Workspace-root full-flow integration tests
+    "tests",
 ]

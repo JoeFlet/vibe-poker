@@ -1,0 +1,26 @@
+[package]
+name = "poker-client-headless"
+version = "0.1.0"
+edition = "2024"
+
+# Test-friendly client harness. Step 25c per DESIGN.md.
+# Used by workspace-root full-flow tests at ../../tests/ to drive
+# end-to-end scenarios against an in-process poker-server. Also
+# exposes a small CLI binary for ad-hoc reproduction.
+
+[dependencies]
+poker_engine = { path = "../poker-engine" }
+poker-client-core = { path = "../poker-client-core" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tracing = "0.1"
+thiserror = "1"
+
+[dev-dependencies]
+poker-server = { path = "../poker-server" }
+tempfile = "3"
+tracing-subscriber = "0.3"
+
+[[bin]]
+name = "poker-client-headless"
+path = "src/main.rs"
