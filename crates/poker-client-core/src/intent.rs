@@ -4,9 +4,16 @@
 
 use poker_engine::game::Action;
 use poker_engine::net::protocol::TableId;
+use serde::{Deserialize, Serialize};
 
 /// The top-level command the host issues against the core.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` / `Deserialize` are derived so scripted test
+/// scenarios (see `poker-client-headless`) can round-trip through
+/// JSON / msgpack files. The on-disk format follows serde's default
+/// representation for enums; no stability guarantees are made — if
+/// you pin a scenario file, re-record it whenever this enum grows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Intent {
     /// Open a TCP / WebSocket connection to `addr`. The core will
     /// emit an [`super::Effect::OpenConnection`] in response so the

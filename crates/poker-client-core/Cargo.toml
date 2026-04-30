@@ -9,4 +9,5 @@ edition = "2024"
 
 [dependencies]
 poker_engine = { path = "../poker-engine" }
+serde = { version = "1", features = ["derive"] }
 thiserror = "1"

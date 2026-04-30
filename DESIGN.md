@@ -893,18 +893,89 @@ resilience to interruption via server-driven resync.
       projection. No `tokio`, no I/O, no platform code. Depends only
       on `poker-engine` for wire types. Every state transition unit-
       tested.
-    - **25b — `poker-client-transport-native`.** Tokio TCP transport
-      + filesystem session-key persistence. Owns the socket pump,
-      forwards inbound `ServerMessage`s into the core, processes the
-      core's outbound `Effect` stream. Implements a small `Transport`
-      trait so a future `poker-client-transport-browser` (wasm +
-      WebSockets + IndexedDB) can slot in.
-    - **25c — `poker-client-headless`.** Test-friendly harness: an
-      in-memory transport pair, a driver that consumes a scripted
-      `Vec<Intent>` and yields a sequence of `ClientView` snapshots,
-      a small CLI binary for ad-hoc reproduction. Used by the
-      workspace-root full-flow tests at `tests/` to drive end-to-end
-      scenarios against an in-process `poker-server`.
+    - **25b — `poker-client-transport-native`.** ✅ Done (2026-04-29).
+      Tokio TCP transport + filesystem session-key persistence.
+      Three layers inside the crate:
+      [transport.rs](crates/poker-client-transport-native/src/transport.rs)
+      defines a small factory-style `Transport` trait plus the
+      channel-backed `TransportHandle` (`mpsc` for both directions,
+      inbound carries a `TransportIn::{Connected, Message, Lost}`
+      enum); a future `poker-client-transport-browser` implements
+      the same trait and returns the same handle shape, keeping
+      the core agnostic of platform.
+      [native.rs](crates/poker-client-transport-native/src/native.rs)
+      is the `NativeTransport` impl — `TcpStream::connect` +
+      `set_nodelay` + a pump task that forwards framed messages
+      both ways until either side EOFs.
+      [session.rs](crates/poker-client-transport-native/src/session.rs)
+      is `SessionStore` — atomic write-then-rename session-key
+      persistence, creates parent dirs lazily, empty-file-is-None
+      semantics on load.
+      [runtime.rs](crates/poker-client-transport-native/src/runtime.rs)
+      is the `NativeClient` facade the Tauri shell consumes: spawns
+      a dedicated worker thread with its own current-thread tokio
+      runtime, owns the `ClientCore` + `Transport` + `SessionStore`,
+      exposes sync `issue(Intent)` / `snapshot() -> ClientView` /
+      `drain_logs()` to any thread. All effects are routed
+      internally (`OpenConnection`/`CloseConnection`/`Send` →
+      transport, `PersistSessionKey` → store, `Log` → `tracing` +
+      host buffer). `Effect::Schedule` is a stub for now — the
+      server's 60s idle timeout leaves slack; heartbeat / prompt
+      deadline ticks will land with a follow-up. Tests: loopback
+      roundtrip (`roundtrip_against_echo_server`), connect failure
+      (`open_failure_reports_connect_error`), graceful handle drop
+      (`handle_drop_tears_down_pump`), session store roundtrip /
+      empty-file / missing-parent, and an end-to-end integration
+      test at [tests/runtime.rs](crates/poker-client-transport-native/tests/runtime.rs)
+      that stands up an in-process `poker-server` and drives a
+      `NativeClient` through `Connect → Register → Welcome` with
+      assertions on view phase, buffered logs, and the persisted
+      session-key file.
+    - **25c — `poker-client-headless`.** ✅ Done (2026-04-29).
+      Three layers inside the crate:
+      [harness.rs](crates/poker-client-headless/src/harness.rs) is
+      `HeadlessClient` — wraps [`ClientCore`] with effect and
+      snapshot logs; scripts inject intents and inbound
+      `ServerMessage`s directly, bypassing any transport. The pure-
+      state-machine tier.
+      [transport.rs](crates/poker-client-headless/src/transport.rs)
+      is `InMemoryTransport` — implements
+      `poker_client_transport_native::Transport`, so
+      `NativeClient::with_transport(transport, session)` works
+      against fully in-memory channels. The paired
+      `InMemoryConnections` listener hands out one `InMemoryServer`
+      per `open()`; tests use that to script the other side of the
+      wire (`server.send(ServerMessage::...)`, `server.close(reason)`,
+      `server.recv()` for outbound `ClientMessage`s). Required a new
+      `TransportHandle::from_channels` constructor in
+      `poker-client-transport-native` so out-of-crate `Transport`
+      implementors can build a handle.
+      [scenario.rs](crates/poker-client-headless/src/scenario.rs)
+      is the scripted-scenario DSL: `Step::{Issue, Receive,
+      ExpectPhase, Expect{label, predicate}}`, a plain `Vec<Step>`
+      `Script`, a `Driver::run` that pumps + records snapshots and
+      stops at the first failed expectation (returning a
+      `DriverResult { snapshots, failure }`), and
+      `Driver::run_and_assert` for panic-on-fail tests. Predicates
+      are `Arc<dyn Fn(&ClientView) -> bool + Send + Sync>` so tests
+      can close over local state. For CLI reproduction files the
+      serde-derived `FileStep` is a subset (`Issue` + `Receive`
+      only) with `load_file_script` / `save_file_script` helpers.
+      `Intent` in `poker-client-core` gained `Serialize` +
+      `Deserialize` derives to make that file format round-trip.
+      [main.rs](crates/poker-client-headless/src/main.rs) is the
+      CLI: `poker-client-headless <scenario.json>` replays a
+      `FileScript`, printing a one-line summary per step (issued
+      intent / received message name, resulting phase, seat /
+      hand / table state). Tests: 9 unit tests covering
+      `HeadlessClient`, the scenario driver (linear success,
+      stop-at-first-failure, panic-message shape, file-script
+      round-trip, predicate discard), and `InMemoryTransport`
+      pair behaviour; 2 integration tests at
+      [tests/in_memory_runtime.rs](crates/poker-client-headless/tests/in_memory_runtime.rs)
+      drive `NativeClient` + `InMemoryTransport` end-to-end
+      through a scripted Register → Welcome → Lobby and an
+      abrupt-server-close → `Phase::Ended` flow.
     - **25d — `client/` Tauri shell.** After the existing repo's
       `main` is reset (with the prior state preserved as the
       `flutter-experiment` tag), the submodule is re-initialised

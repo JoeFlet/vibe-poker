@@ -11,6 +11,14 @@ edition = "2024"
 poker_engine = { path = "../poker-engine" }
 poker-client-core = { path = "../poker-client-core" }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tracing = "0.1"
 thiserror = "1"
+
+[dev-dependencies]
+# Integration tests drive NativeClient against an in-process
+# poker-server. Kept out of [dependencies] so downstream crates
+# don't pull the server transitively.
+poker-server = { path = "../poker-server" }
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "test-util"] }

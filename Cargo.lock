@@ -2294,6 +2294,7 @@ name = "poker-client-core"
 version = "0.1.0"
 dependencies = [
  "poker_engine",
+ "serde",
  "thiserror 1.0.69",
 ]
 
@@ -2302,8 +2303,11 @@ name = "poker-client-headless"
 version = "0.1.0"
 dependencies = [
  "poker-client-core",
+ "poker-client-transport-native",
  "poker-server",
  "poker_engine",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2316,7 +2320,9 @@ name = "poker-client-transport-native"
 version = "0.1.0"
 dependencies = [
  "poker-client-core",
+ "poker-server",
  "poker_engine",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

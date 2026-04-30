@@ -11,10 +11,15 @@ edition = "2024"
 [dependencies]
 poker_engine = { path = "../poker-engine" }
 poker-client-core = { path = "../poker-client-core" }
+# Needed for the `Transport` trait that `InMemoryTransport` implements,
+# and for `NativeClient::with_transport` in tests and the CLI.
+poker-client-transport-native = { path = "../poker-client-transport-native" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tracing = "0.1"
 thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 poker-server = { path = "../poker-server" }
