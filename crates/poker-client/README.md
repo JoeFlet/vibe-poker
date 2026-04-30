@@ -1,6 +1,11 @@
 # poker-client
 
-> **Status: deprecated reference / smoke-test harness.** Frozen at `PROTOCOL_VERSION = 3`. The next-generation playable client is being built in a separate repository and is expected to land here later as a git submodule (see [DESIGN.md](../../DESIGN.md) step 24). This crate stays in-tree only as a known-good smoke-test counterparty for `poker-server`. **Only protocol-compatibility bug fixes land here** — no UI features, no UX polish, no new modes.
+> **Status: deprecated — smoke-test harness only.** Frozen at `PROTOCOL_VERSION = 3`.
+> The production client is the Tauri 2 + SolidJS app in [client/](../../client/).
+> This crate stays in-tree as a known-good test counterparty for `poker-server`
+> and as a functional replay viewer for `FileSink` logs. **Only protocol-compatibility
+> bug fixes land here.** It will be removed when `PROTOCOL_VERSION` bumps to 4
+> (DESIGN.md step 26).
 
 An `egui`/`eframe` desktop app with two modes:
 
@@ -10,22 +15,24 @@ An `egui`/`eframe` desktop app with two modes:
 cargo run -p poker-client -- --replay session.mp
 ```
 
-Loads any `FileSink` log (engine output, server-recorded hands, dataset matchups) and lets you scrub through the events. A cursor walks `events[0..=i]` and each frame derives a [Snapshot](src/snapshot.rs) — hand id / dealer / street / pot, board cards, per-seat hole cards with folded/all-in/committed flags, the action log, and the final `HandResult` block. ⏮◀▶⏭ buttons step the cursor; the slider jumps anywhere; clicking an event in the side panel snaps the cursor to it.
+Loads any `FileSink` log (engine output, server-recorded hands, dataset matchups) and lets you scrub through the events. ⏮◀▶⏭ buttons step the cursor; the slider jumps anywhere; clicking an event in the side panel snaps to it.
 
-## Live mode
+Each frame derives a [Snapshot](src/snapshot.rs): hand id / dealer / street / pot, board cards, per-seat hole cards with folded / all-in / committed flags, action log, and the final `HandResult` block.
+
+## Live mode (smoke test only)
 
 ```sh
 cargo run -p poker-server &
 cargo run -p poker-client -- --connect 127.0.0.1:7878 --username alice
 ```
 
-Connects to a [poker-server](../poker-server/), handshakes via `Hello`, browses the lobby, sits at a table, and plays. The egui side stays purely synchronous; network I/O lives in [LiveClient](src/live_net.rs), which owns a worker thread running a current-thread tokio runtime and exposes non-blocking `send` / `drain` (paired `mpsc::UnboundedChannel`s).
+Connects to [poker-server](../poker-server/), browses the lobby, sits at a table, and plays. The egui side stays purely synchronous; network I/O lives in [LiveClient](src/live_net.rs) (worker thread + current-thread tokio runtime, paired `mpsc` channels). [LiveApp](src/live.rs) is the state machine: Connecting → Lobby → Seated → Ended.
 
-[LiveApp](src/live.rs) is the egui state machine: Connecting → Lobby → Seated → Ended. Both modes share [snapshot.rs](src/snapshot.rs) — replay slices `events[..=cursor]` and re-derives, live calls `Snapshot::apply(&event)` incrementally as `TableEvent`s arrive.
+For a full-featured live client, use the [client/](../../client/) Tauri shell instead.
 
 ## Tests
 
 ```sh
-cargo test -p poker-client                                    # all
-cargo test -p poker-client --bin poker-client live_client     # live-mode smoke
+cargo test -p poker-client                                   # all
+cargo test -p poker-client --bin poker-client live_client    # live-mode smoke
 ```

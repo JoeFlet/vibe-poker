@@ -976,14 +976,57 @@ resilience to interruption via server-driven resync.
       drive `NativeClient` + `InMemoryTransport` end-to-end
       through a scripted Register → Welcome → Lobby and an
       abrupt-server-close → `Phase::Ended` flow.
-    - **25d — `client/` Tauri shell.** After the existing repo's
-      `main` is reset (with the prior state preserved as the
-      `flutter-experiment` tag), the submodule is re-initialised
-      as a Tauri 2 + SolidJS + Vite + TypeScript app, package-
-      managed by pnpm. Its Rust glue depends on
-      `poker-client-core` + `poker-client-transport-native`; its
-      job is forwarding intents from the frontend to the core,
-      pumping effects, and exposing `snapshot()` over Tauri commands.
+    - **25d — `client/` Tauri shell.** ✅ Scaffold done (2026-04-29).
+      The `client/` submodule (reset to a blank repo by the user
+      earlier in the day; the Flutter experiment lives on as the
+      `flutter-experiment` tag) is now a Tauri 2 + SolidJS + Vite +
+      TypeScript + pnpm app. Layout:
+        - `client/src-tauri/` — Rust glue. Standalone Cargo project
+          (opt-out of the parent workspace via an empty `[workspace]`
+          table) with path deps on `poker-client-core` and
+          `poker-client-transport-native`. `src/state.rs` owns a
+          single `AppState { client: Arc<NativeClient> }`, built
+          against a session key file under Tauri's
+          `app_data_dir` / `session.key`. A background tokio task
+          (`spawn_event_pump`) polls `NativeClient::snapshot` on a
+          20 ms cadence and emits `snapshot_changed` +  `log_entry`
+          Tauri events — the 20 ms interval is the animation
+          substrate (principle 2 permits up to a 1 s stale-state
+          budget), well above UI frame time. `src/commands.rs`
+          exposes three `#[tauri::command]`s:
+          `get_snapshot` → `ClientView` (initial seed),
+          `issue_intent(Intent)` → `Result<(), String>`,
+          `drain_logs() -> Vec<LogEvent>`. Required adding serde
+          derives on `Phase`, `CurrentHand`, and `ClientView` in
+          `poker-client-core` so Tauri's IPC can ship them directly.
+          Integration test at
+          [client/src-tauri/tests/link.rs](client/src-tauri/tests/link.rs)
+          is a one-liner smoke that the path deps resolve (`cargo
+          test --manifest-path client/src-tauri/Cargo.toml` runs
+          green).
+        - `client/src/` — SolidJS frontend. `types.ts` carries
+          hand-maintained TS mirrors of `ClientView` / `Intent` /
+          `Action` / `Phase` (serde's default enum representation:
+          unit variants are bare strings, payload variants are
+          single-key objects). `bridge.ts` wraps the three Tauri
+          commands + two events. `store.ts` is a SolidJS
+          `createStore<ClientView>` with a bounded inbound queue
+          (cap 50 — equal to the 1 s @ 20 ms budget) and a 500-
+          entry log ring. `views/` has four screens that project
+          `view`: `Connect` (register / password form),
+          `Lobby` (table list + join), `Seated` (seat list, board +
+          hole cards rendered from raw `Card` byte indices, action
+          panel that lights up only on `awaiting_action`), `Ended`.
+          No local game state — every render is `ClientView` → DOM.
+        - `client/README.md` spells out the run loop
+          (`pnpm install` → `pnpm tauri dev` + `cargo run -p
+          poker-server` in the parent).
+      This is the functional-loop MVP: connect, register, lobby,
+      seat, submit actions. No card animations, no polish, no
+      mid-hand replay (that lands with DESIGN step 26). TS
+      typechecks; Vite builds a 30 KB gzipped bundle; Rust side
+      compiles + test passes; parent workspace's 250+ tests still
+      green.
 
 29. **Step 26 — Server-side hand replay (protocol v4).** Required by
     principle 3. The server gets a new client verb, working title

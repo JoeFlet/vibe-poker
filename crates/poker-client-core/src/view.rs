@@ -2,15 +2,22 @@
 //! `CLIENT_PRINCIPLES.md`, the frontend MUST NOT keep a parallel
 //! copy of any of this — it derives its UI as a pure function of
 //! `ClientView`.
+//!
+//! `Serialize` + `Deserialize` are derived so the Tauri shell can
+//! ship `ClientView` over the invoke / event channel without a
+//! mirror type. The on-wire JSON follows serde's default
+//! representation for enums (internally tagged for struct variants);
+//! frontend types are hand-maintained in `client/src/types.ts`.
 
 use poker_engine::game::{LegalActions, Street};
 use poker_engine::net::protocol::{LifetimeStats, PlayerId, SeatInfo, TableId, TableInfo};
+use serde::{Deserialize, Serialize};
 
 /// High-level connection / session phase. Richer per-phase state is
 /// in [`ClientView`] sibling fields. The presence of
 /// [`ClientView::current_hand`] is what distinguishes "seated waiting
 /// between hands" from "seated, hand in flight."
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     /// No connection. Initial state, and after `Disconnect` /
     /// `ConnectionLost`.
@@ -39,7 +46,7 @@ pub enum Phase {
 /// means strictly the in-flight hand. Lifetime stats from
 /// `Welcome.stats` ride here for convenience but are surface
 /// data only.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientView {
     pub phase: Phase,
 
@@ -71,7 +78,7 @@ pub struct ClientView {
 }
 
 /// Per-hand state. Reset at every `HandStarted`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentHand {
     pub hand_id: u64,
     pub dealer: usize,

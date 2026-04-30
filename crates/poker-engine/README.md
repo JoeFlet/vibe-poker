@@ -1,28 +1,30 @@
 # poker-engine
 
-Pure-Rust Texas Hold'em rules library. No I/O, no tokio, no I/O-bound dependencies — just cards, deck, evaluator, game state, betting rules, the `Agent` trait, the event sink hierarchy, and a single-threaded / parallel `SimRunner`.
+Pure-Rust Texas Hold'em rules library. No I/O, no tokio, no async — just cards, deck, evaluator, game state, betting rules, the `Agent` trait, the event sink hierarchy, a single-threaded / parallel `SimRunner`, and the wire-protocol types shared by client and server.
 
 This crate is the foundation every other crate in the workspace builds on:
 
-- **[poker-trainer](../poker-trainer/)** consumes it for MCCFR training and dataset aggregation.
-- **[poker-server](../poker-server/)** runs `Engine::run_hand` on `spawn_blocking` to drive remote players.
-- **[poker-client](../poker-client/)** uses it for `EngineEvent` shapes and the `Snapshot` derivation.
+- **[poker-trainer](../poker-trainer/)** — MCCFR training and dataset aggregation.
+- **[poker-server](../poker-server/)** — runs `Engine::run_hand` on `spawn_blocking` to drive remote players.
+- **[poker-client-core](../poker-client-core/)** — pure synchronous client state machine; imports `EngineEvent` and the `net` wire types.
+- **[poker-client-transport-native](../poker-client-transport-native/)** — tokio TCP transport that sends / receives `ClientMessage` / `ServerMessage`.
+- **[poker-client](../poker-client/)** _(deprecated)_ — the old `egui` client; uses `EngineEvent` shapes and `Snapshot` derivation.
 
 ## Public surface
 
 | Module | What it provides |
 |---|---|
-| `core` | `Card`, `Deck`, `RsPokerEvaluator` (lookup-table 7-card eval), `NaiveEvaluator` (cross-check), `HandRank` |
-| `game` | `Engine`, `BettingRules`, `EngineEvent`, `EventSink`/`NullSink`/`VecSink`/`FileSink`, `read_event_log`, `Action`, `LegalActions`, `HandResult`, `tree::GameTree` |
+| `core` | `Card`, `Deck`, `RsPokerEvaluator` (lookup-table 7-card eval ~50 ns), `NaiveEvaluator` (cross-check), `HandRank` |
+| `game` | `Engine`, `BettingRules`, `EngineEvent`, `EventSink` / `NullSink` / `VecSink` / `FileSink`, `read_event_log`, `Action`, `LegalActions`, `HandResult`, `tree::GameTree` |
 | `agent` | `Agent` trait, `Observation`, `RunConfig`, `builtin::{RandomAgent, CallingStation, ScriptedAgent}`, `human::HumanAgent`, `personas::{Nit, Tag, Lag, Maniac, TiltProne}` |
 | `sim` | `SimRunner`, `run_parallel`, `SimConfig`, `SeedMode`, `StackPolicy` |
 | `stats` | `StatsSink`, `print_report` |
 | `abstraction` | `PreflopClass` (suit-isomorphic 169-class bucketing) |
-| `net` | `frame::{encode, decode, parse_length_prefix}`, `protocol::{ClientMessage, ServerMessage, ...}` shared with the server |
+| `net` | `frame::{encode, decode, parse_length_prefix, MAX_FRAME_BYTES}`, `protocol::{ClientMessage, ServerMessage, PROTOCOL_VERSION, …}` |
 
 ## CLI
 
-`poker_report` is the engine's only binary — a quick "what does this matchup look like over N hands" stat printer. Usage and agent specs are in the [root README](../../README.md#poker_report).
+`poker_report` is the engine's binary — a quick per-seat stat table over N simulated hands. Agent specs, flags, and output format are documented in the [root README](../../README.md#quick-stats-run-poker_report).
 
 ## Design rules
 
@@ -54,7 +56,9 @@ for outcome in &result.seats {
 }
 ```
 
-For `Agent` implementation, event sinks, and bulk simulation, see the [root README](../../README.md).
+## Wire protocol
+
+`net::protocol` carries the `ClientMessage` / `ServerMessage` enum definitions shared by client and server. Framing is `[u32 LE length][rmp-serde bytes]` — identical to the `FileSink` format so server broadcasts can be spooled to a log without re-encoding. Full spec at [src/net/PROTOCOL.md](src/net/PROTOCOL.md).
 
 ## Tests / benches
 
