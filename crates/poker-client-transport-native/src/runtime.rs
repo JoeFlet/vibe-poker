@@ -49,6 +49,10 @@ pub struct NativeClient {
     view_rx: watch::Receiver<ClientView>,
     log_buffer: Arc<Mutex<Vec<LogEntry>>>,
     thread: Option<thread::JoinHandle<()>>,
+    /// Kept on the struct (in addition to the worker thread) so
+    /// callers can query the persisted session key without going
+    /// through an async channel. `SessionStore` is `Clone` (cheap).
+    session_store: SessionStore,
 }
 
 impl NativeClient {
@@ -76,6 +80,11 @@ impl NativeClient {
         let log_buffer = Arc::new(Mutex::new(Vec::new()));
         let log_buffer_thread = Arc::clone(&log_buffer);
 
+        // Keep a clone on the struct for synchronous queries
+        // (e.g. `session_key()`). The worker thread owns the
+        // original for async persistence operations.
+        let session_store_ref = session_store.clone();
+
         let thread = thread::Builder::new()
             .name("poker-client-runtime".into())
             .spawn(move || {
@@ -98,6 +107,7 @@ impl NativeClient {
             view_rx,
             log_buffer,
             thread: Some(thread),
+            session_store: session_store_ref,
         })
     }
 
@@ -120,6 +130,14 @@ impl NativeClient {
     /// entry was also handed to `tracing` at its native level.
     pub fn drain_logs(&self) -> Vec<LogEntry> {
         std::mem::take(&mut *self.log_buffer.lock().unwrap())
+    }
+
+    /// Return the currently persisted session key, if any.
+    /// Reads directly from the filesystem — cheap (one `read_to_string`).
+    /// Used by hosts that want to attempt silent re-authentication
+    /// on startup without going through the full intent/effect flow.
+    pub fn session_key(&self) -> Option<String> {
+        self.session_store.load().ok().flatten()
     }
 }
 
