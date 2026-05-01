@@ -22,7 +22,7 @@ context: |
 
   ## Critical invariants
   - deck_seed is the sole source of deal entropy.
-  - PROTOCOL_VERSION = 3; bump on any backwards-incompatible wire change.
+  - PROTOCOL_VERSION = 4; bump on any backwards-incompatible wire change.
   - Integer chips only: u32 for stacks/bets, i32 for chip_delta.
 
   ## Capability specs (openspec/specs/)

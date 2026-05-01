@@ -87,7 +87,7 @@ Every meaningful moment in a hand emits an event: `HandStarted` / `HoleCardsDeal
 
 ### Wire protocol
 
-Defined once in [crates/poker-engine/src/net/](crates/poker-engine/src/net/) and linked by `poker-server`, `poker-client-core`, and the Tauri glue in `client/src-tauri/`. Same `[u32 LE length][rmp-serde bytes]` framing as `FileSink`, but carrying `ClientMessage` / `ServerMessage` envelopes. `PROTOCOL_VERSION` is currently **3**; bumped on any backwards-incompatible change. Long-form spec at [crates/poker-engine/src/net/PROTOCOL.md](crates/poker-engine/src/net/PROTOCOL.md).
+Defined once in [crates/poker-engine/src/net/](crates/poker-engine/src/net/) and linked by `poker-server`, `poker-client-core`, and the Tauri glue in `client/src-tauri/`. Same `[u32 LE length][rmp-serde bytes]` framing as `FileSink`, but carrying `ClientMessage` / `ServerMessage` envelopes. `PROTOCOL_VERSION` is currently **4**; bumped on any backwards-incompatible change. Long-form spec at [crates/poker-engine/src/net/PROTOCOL.md](crates/poker-engine/src/net/PROTOCOL.md).
 
 ## Workspace-wide invariants
 
@@ -110,7 +110,7 @@ Full step-by-step plan lives in [DESIGN.md](DESIGN.md). Summary:
 | 23 | `PROTOCOL.md` long-form wire spec | ✅ |
 | 24 | Deprecate old client; per-crate READMEs | ✅ |
 | 25a–d | New client architecture: core, transport, headless, Tauri shell | ✅ |
-| 26 | Server-side hand replay verb (`RequestReplay`), protocol v4 | 🔲 |
+| 26 | Server-side hand replay verb (`RequestReplay`), protocol v4 | ✅ |
 | 27 | Mid-hand persistence atomicity — verify + regression test | 🔲 |
 
 ## Tests

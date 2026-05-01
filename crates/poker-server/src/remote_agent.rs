@@ -70,6 +70,18 @@ impl Agent for RemoteAgent {
             legal: obs.legal_actions,
             deadline_ms: self.deadline.as_millis() as u32,
         });
+        // Mirror into the seat's replay buffer so a mid-hand
+        // `RequestReplay` reconstructs the in-flight prompt the same
+        // way the seat saw it live. The re-issue path in
+        // `Table::reconnect_player` still re-sends the active prompt
+        // directly, so replay + reconnect compose idempotently.
+        self.link.replay_push(&ServerMessage::Prompt {
+            table_id: self.table_id,
+            hand_id: self.current_hand,
+            seat: obs.position,
+            legal: obs.legal_actions,
+            deadline_ms: self.deadline.as_millis() as u32,
+        });
 
         let deadline = self.deadline;
         let result = self.runtime.block_on(async move {

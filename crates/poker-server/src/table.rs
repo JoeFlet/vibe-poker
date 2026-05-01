@@ -311,6 +311,21 @@ impl Table {
         }
     }
 
+    /// Snapshot of a seated player's `SeatLink` and their seat index,
+    /// used by [`crate::session`] to service `RequestReplay` without
+    /// holding the table lock across the handler.
+    pub async fn seat_link_for(&self, player_id: PlayerId) -> Option<(SeatIndex, Arc<SeatLink>)> {
+        let inner = self.state.lock().await;
+        for (idx, slot) in inner.seats.iter().enumerate() {
+            if let Some(seat) = slot {
+                if seat.player_id == player_id {
+                    return Some((idx, Arc::clone(&seat.link)));
+                }
+            }
+        }
+        None
+    }
+
     pub async fn shutdown(&self) {
         self.shutdown.notify_one();
     }
@@ -679,19 +694,23 @@ impl BroadcastSink {
 
     fn broadcast_all(&self, event: EngineEvent) {
         for link in &self.links {
-            link.current().try_send(ServerMessage::TableEvent {
+            let msg = ServerMessage::TableEvent {
                 table_id: self.table_id,
                 event: event.clone(),
-            });
+            };
+            link.replay_push(&msg);
+            link.current().try_send(msg);
         }
     }
 
     fn send_to(&self, engine_seat: SeatIndex, event: EngineEvent) {
         if let Some(link) = self.links.get(engine_seat) {
-            link.current().try_send(ServerMessage::TableEvent {
+            let msg = ServerMessage::TableEvent {
                 table_id: self.table_id,
                 event,
-            });
+            };
+            link.replay_push(&msg);
+            link.current().try_send(msg);
         }
     }
 
@@ -720,6 +739,15 @@ impl EventSink for BroadcastSink {
         // from `hands.log` matches the engine's own event stream.
         self.record(event);
         match event {
+            EngineEvent::HandStarted { hand_id, .. } => {
+                // Begin per-seat replay buffers *before* broadcasting
+                // the event, so `HandStarted` itself is the first
+                // entry in every seat's buffer.
+                for link in &self.links {
+                    link.replay_begin(*hand_id);
+                }
+                self.broadcast_all(event.clone());
+            }
             EngineEvent::HoleCardsDealt { seat, .. } => {
                 // Only the owning seat sees its hole cards.
                 self.send_to(*seat, event.clone());
@@ -735,16 +763,27 @@ impl EventSink for BroadcastSink {
                 self.broadcast_all(event.clone());
             }
             EngineEvent::HandEnded { hand_id, result } => {
-                // Per-recipient filtered result.
+                // Per-recipient filtered result. Append to each
+                // seat's replay buffer before we seal it so a
+                // `RequestReplay` racing in on the very last live
+                // event still includes `HandEnded`.
                 for (engine_seat, link) in self.links.iter().enumerate() {
                     let filtered = self.filtered_hand_end(Some(engine_seat), result);
-                    link.current().try_send(ServerMessage::TableEvent {
+                    let msg = ServerMessage::TableEvent {
                         table_id: self.table_id,
                         event: EngineEvent::HandEnded {
                             hand_id: *hand_id,
                             result: filtered,
                         },
-                    });
+                    };
+                    link.replay_push(&msg);
+                    link.current().try_send(msg);
+                }
+                // Seal replay buffers — per `server-behavior` spec,
+                // `HandEnded` ends the in-flight hand and subsequent
+                // `RequestReplay { hand_id }` MUST be rejected.
+                for link in &self.links {
+                    link.replay_end();
                 }
                 // Reset for next hand (the sink is single-hand-scoped
                 // in practice, but be robust if reused).

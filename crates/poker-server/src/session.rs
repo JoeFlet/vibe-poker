@@ -28,6 +28,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use poker_engine::game::HandId;
 use poker_engine::net::protocol::{
     AuthMode, ClientMessage, PROTOCOL_VERSION, RejectReason, ServerMessage, TableId,
 };
@@ -346,8 +347,48 @@ where
                     });
                 }
             }
+            ClientMessage::RequestReplay { hand_id } => {
+                handle_request_replay(conn, ctx, hand_id).await;
+            }
         }
     }
+}
+
+/// Serve a `RequestReplay`. Preconditions (per `server-behavior`
+/// spec): the requesting session must be seated at a table and the
+/// `hand_id` must match that seat's in-flight hand. Any mismatch
+/// yields `ActionRejected { reason: "not seated at this hand" }` —
+/// deliberately a single stable reason so a non-Rust client can match
+/// on it without enumerating sub-cases.
+async fn handle_request_replay(
+    conn: &Arc<Connection>,
+    ctx: &ServerContext,
+    hand_id: HandId,
+) {
+    let reject = || {
+        conn.try_send(ServerMessage::ActionRejected {
+            reason: "not seated at this hand".into(),
+        });
+    };
+    // Must be seated somewhere …
+    let Some(table_id) = ctx.tables.current_table(conn.player_id).await else {
+        reject();
+        return;
+    };
+    let Some(table) = ctx.tables.get(table_id).await else {
+        reject();
+        return;
+    };
+    // … and the seat's replay buffer must currently target `hand_id`.
+    let Some((_seat, link)) = table.seat_link_for(conn.player_id).await else {
+        reject();
+        return;
+    };
+    let Some(events) = link.replay_snapshot(hand_id) else {
+        reject();
+        return;
+    };
+    conn.try_send(ServerMessage::ReplayEvents { hand_id, events });
 }
 
 async fn handle_join(

@@ -142,14 +142,40 @@ pub async fn writer_task<W: AsyncWrite + Unpin>(
 /// outbound traffic and any not-yet-resolved `PendingAction` migrate
 /// to the new socket without restarting the hand. See step 22c in
 /// `DESIGN.md`.
+///
+/// The seat also carries a **replay buffer**: every `ServerMessage`
+/// the [`crate::table::BroadcastSink`] fans to this seat during the
+/// current in-flight hand is appended here, in order, with masking
+/// already applied. On `RequestReplay` the session reads a snapshot
+/// of this buffer and ships it verbatim so the seat's state machine
+/// can reconstruct `CurrentHand` without re-running the engine.
+/// The buffer is cleared at the start of every new hand
+/// (`HandStarted`) and dropped with the `SeatLink` itself when the
+/// seat vacates. See step 26 / `request-replay-verb`.
 pub struct SeatLink {
     inner: StdRwLock<Arc<Connection>>,
+    /// Per-seat ordered replay buffer for the current in-flight hand.
+    /// Scoped by `hand_id` so a stale `RequestReplay` (wrong id) is
+    /// rejected rather than serving up last hand's events. `None` when
+    /// no hand is in flight; `Some((hand_id, events))` while a hand
+    /// runs.
+    replay: StdMutex<ReplayBuffer>,
+}
+
+/// Per-seat replay state. `hand_id` is set by `HandStarted` and
+/// cleared by `HandEnded` (or on the next `HandStarted` if the
+/// server somehow skipped the end event).
+#[derive(Default)]
+pub struct ReplayBuffer {
+    pub hand_id: Option<HandId>,
+    pub events: Vec<ServerMessage>,
 }
 
 impl SeatLink {
     pub fn new(conn: Arc<Connection>) -> Arc<Self> {
         Arc::new(Self {
             inner: StdRwLock::new(conn),
+            replay: StdMutex::new(ReplayBuffer::default()),
         })
     }
 
@@ -172,5 +198,52 @@ impl SeatLink {
 
     pub fn session_id(&self) -> i64 {
         self.current().session_id
+    }
+
+    /// Begin a fresh replay buffer for `hand_id`. Any prior contents
+    /// are dropped — they belong to a finished hand. Call exactly
+    /// once at the moment [`BroadcastSink`] sees `HandStarted`.
+    ///
+    /// [`BroadcastSink`]: crate::table::BroadcastSink
+    pub fn replay_begin(&self, hand_id: HandId) {
+        let mut buf = self.replay.lock().expect("replay mutex poisoned");
+        buf.hand_id = Some(hand_id);
+        buf.events.clear();
+    }
+
+    /// Append a freshly-fanned outbound `ServerMessage` to this seat's
+    /// replay buffer. No-op if no hand is in flight (e.g. a
+    /// `TableState` fired between hands is not part of any replay).
+    pub fn replay_push(&self, msg: &ServerMessage) {
+        let mut buf = self.replay.lock().expect("replay mutex poisoned");
+        if buf.hand_id.is_some() {
+            buf.events.push(msg.clone());
+        }
+    }
+
+    /// Seal the current hand's replay buffer — subsequent `replay_push`
+    /// calls are ignored until the next `replay_begin`. The stored
+    /// events are retained so a client that was slow to reconnect
+    /// can still replay a just-ended hand until the next
+    /// `HandStarted`. (The spec's "buffer dropped on HandEnded" means
+    /// it's no longer *live* — which is what clearing `hand_id`
+    /// conveys; the bytes are reclaimed on the next `replay_begin`.)
+    pub fn replay_end(&self) {
+        let mut buf = self.replay.lock().expect("replay mutex poisoned");
+        buf.hand_id = None;
+        buf.events.clear();
+    }
+
+    /// Return a snapshot of the current hand's replay buffer. Returns
+    /// `None` if no hand is in flight or if `hand_id` doesn't match
+    /// the buffer's hand — either way, the caller should reply with
+    /// `ActionRejected { reason: "not seated at this hand" }`.
+    pub fn replay_snapshot(&self, hand_id: HandId) -> Option<Vec<ServerMessage>> {
+        let buf = self.replay.lock().expect("replay mutex poisoned");
+        if buf.hand_id == Some(hand_id) {
+            Some(buf.events.clone())
+        } else {
+            None
+        }
     }
 }

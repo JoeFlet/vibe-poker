@@ -342,6 +342,26 @@ impl ClientCore {
                 out.push(log(LogLevel::Warn, "core: action rejected",
                     &[("reason", reason)]));
             }
+            ServerMessage::ReplayEvents { hand_id, events } => {
+                // Mid-hand replay from the server (step 26). Feed each
+                // contained message back through `handle_inbound` so
+                // the state machine applies them identically to live
+                // play. The machine is deterministic and idempotent,
+                // so overlap with already-processed live events is
+                // harmless — see `client-core` spec "No duplicate
+                // processing".
+                let n = events.len();
+                out.push(log(LogLevel::Info, "core: replay begin",
+                    &[("hand_id", hand_id.to_string()),
+                      ("events", n.to_string())]));
+                for event in events {
+                    let nested = self.handle_inbound(event);
+                    out.extend(nested);
+                }
+                out.push(log(LogLevel::Info, "core: replay end",
+                    &[("hand_id", hand_id.to_string()),
+                      ("events", n.to_string())]));
+            }
         }
         out
     }
@@ -472,6 +492,7 @@ fn kind_of_client_message(msg: &ClientMessage) -> &'static str {
         ClientMessage::JoinTable { .. } => "JoinTable",
         ClientMessage::LeaveTable { .. } => "LeaveTable",
         ClientMessage::SubmitAction { .. } => "SubmitAction",
+        ClientMessage::RequestReplay { .. } => "RequestReplay",
         ClientMessage::Heartbeat => "Heartbeat",
         ClientMessage::Disconnect => "Disconnect",
     }

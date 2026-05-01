@@ -42,7 +42,7 @@ The load-bearing trick is the bridge from synchronous `Engine::run_hand` (which 
 
 ## Wire protocol
 
-Defined once in [poker_engine::net::protocol](../poker-engine/src/net/protocol.rs) and linked by client and server. Frames are `[u32 LE length][rmp-serde bytes]` — same format `FileSink` uses. `PROTOCOL_VERSION` (currently **3**) is bumped on any backwards-incompatible change. Full spec at [crates/poker-engine/src/net/PROTOCOL.md](../poker-engine/src/net/PROTOCOL.md).
+Defined once in [poker_engine::net::protocol](../poker-engine/src/net/protocol.rs) and linked by client and server. Frames are `[u32 LE length][rmp-serde bytes]` — same format `FileSink` uses. `PROTOCOL_VERSION` (currently **4**) is bumped on any backwards-incompatible change. Full spec at [crates/poker-engine/src/net/PROTOCOL.md](../poker-engine/src/net/PROTOCOL.md).
 
 ## Persistence
 

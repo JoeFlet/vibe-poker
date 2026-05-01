@@ -6,7 +6,7 @@
 //! by [`super::frame`]; whether they ride TCP, WebSockets, or an
 //! in-process channel is the caller's choice.
 //!
-//! Handshake (PROTOCOL_VERSION 3): the first message on a fresh
+//! Handshake (PROTOCOL_VERSION 4): the first message on a fresh
 //! connection is either [`ClientMessage::Register`] (account creation)
 //! or [`ClientMessage::Authenticate`] (existing account, by password
 //! or session key). Both succeed with [`ServerMessage::Welcome`]
@@ -24,7 +24,7 @@ use crate::game::{Action, EngineEvent, HandId, LegalActions, SeatIndex};
 /// Bumped on any backwards-incompatible change to message shapes.
 /// The server sends its version in `Welcome` / `Rejected`; clients
 /// SHOULD refuse to proceed against a mismatched major version.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Stable identifier for a poker table. Allocated by the server.
 pub type TableId = u32;
@@ -131,6 +131,18 @@ pub enum ClientMessage {
         action: Action,
     },
 
+    /// Ask the server for the full per-seat `ServerMessage` stream
+    /// for the currently-in-flight hand at the seated table. Intended
+    /// for clients reconnecting mid-hand: the server replies with
+    /// [`ServerMessage::ReplayEvents`] carrying every message that
+    /// seat received from `HandStarted` up to the snapshot point,
+    /// with masking preserved byte-for-byte. The connection MUST be
+    /// seated at a table and the `hand_id` MUST match the current
+    /// hand; otherwise the server replies
+    /// [`ServerMessage::ActionRejected`] with
+    /// `"not seated at this hand"`.
+    RequestReplay { hand_id: HandId },
+
     /// Optional keepalive. The server echoes a `Heartbeat` back.
     Heartbeat,
     /// Graceful close. The server may flush stats and reply with
@@ -204,6 +216,19 @@ pub enum ServerMessage {
     /// (sit failed, action illegal, table missing, ...). Always
     /// non-fatal; the connection stays open.
     ActionRejected { reason: String },
+
+    /// Ordered per-seat replay of the in-flight hand, in response to
+    /// [`ClientMessage::RequestReplay`]. `events` is the exact
+    /// `ServerMessage` sequence that seat received since
+    /// `HandStarted`, with hole-card masking preserved. Clients
+    /// ingest this by feeding each inner message through their state
+    /// machine in order, identically to live play — the machine is
+    /// deterministic and idempotent, so overlap with already-received
+    /// live events is harmless.
+    ReplayEvents {
+        hand_id: HandId,
+        events: Vec<ServerMessage>,
+    },
 
     /// Echo of a client heartbeat.
     Heartbeat,

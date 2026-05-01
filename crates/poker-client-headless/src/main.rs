@@ -122,6 +122,7 @@ fn discriminant_name(msg: &poker_engine::net::protocol::ServerMessage) -> &'stat
         ServerMessage::TableEvent { .. } => "TableEvent",
         ServerMessage::Prompt { .. } => "Prompt",
         ServerMessage::ActionRejected { .. } => "ActionRejected",
+        ServerMessage::ReplayEvents { .. } => "ReplayEvents",
     }
 }
 

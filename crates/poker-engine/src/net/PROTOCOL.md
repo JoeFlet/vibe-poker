@@ -2,7 +2,7 @@
 
 This document specifies the wire protocol implemented by [`poker-server`](../../../poker-server/) and consumed by clients (the in-tree `poker-client` plus any future client). It is sufficient to build a non-Rust client without reading server source.
 
-It is versioned in lockstep with [`PROTOCOL_VERSION`](protocol.rs) (defined in [`protocol.rs`](protocol.rs)). The current version is **3**.
+It is versioned in lockstep with [`PROTOCOL_VERSION`](protocol.rs) (defined in [`protocol.rs`](protocol.rs)). The current version is **4**.
 
 The Rust types in [`protocol.rs`](protocol.rs) are the canonical schema. This file describes how those types are framed, sequenced, and interpreted on the wire.
 
@@ -46,7 +46,7 @@ The wire format is the **compact** (default) `rmp-serde` encoding — `to_vec`, 
 - **`Card`** is a single byte 0–51: `(rank << 2) | suit`. Rank 0 = Two, …, 12 = Ace; suit 0 = Clubs, 1 = Diamonds, 2 = Hearts, 3 = Spades.
 - **Chip amounts** are unsigned 32-bit big-blind-denominated integers. There are no floats anywhere in the protocol. `chip_delta` (signed 32-bit) is the only signed chip field.
 
-> **Concrete example.** `ServerMessage::Welcome { protocol_version: 3, player_id: 1, username: "alice", session_key: "k", stats: LifetimeStats::default() }` encodes as the 28-byte sequence `81 a7 'Welcome' 95 03 01 a5 'alice' a1 'k' 97 00 00 00 00 00 00 00`: a one-key map (`81`) with key `"Welcome"`, whose value is a 5-element fixarray (`95`) holding the five struct fields, the last of which is itself a 7-element fixarray (`97`) for `LifetimeStats`. **No field-name strings appear on the wire.** A non-Rust client must decode by position, not by name. The invariant is pinned by `structs_serialize_as_positional_arrays_not_maps` in [`protocol.rs`](protocol.rs).
+> **Concrete example.** `ServerMessage::Welcome { protocol_version: 4, player_id: 1, username: "alice", session_key: "k", stats: LifetimeStats::default() }` encodes as the 28-byte sequence `81 a7 'Welcome' 95 04 01 a5 'alice' a1 'k' 97 00 00 00 00 00 00 00`: a one-key map (`81`) with key `"Welcome"`, whose value is a 5-element fixarray (`95`) holding the five struct fields, the last of which is itself a 7-element fixarray (`97`) for `LifetimeStats`. **No field-name strings appear on the wire.** A non-Rust client must decode by position, not by name. The invariant is pinned by `structs_serialize_as_positional_arrays_not_maps` in [`protocol.rs`](protocol.rs).
 
 ---
 
@@ -118,7 +118,7 @@ ClientMessage::Register {
 
 Server-side validation:
 
-- `protocol_version` must equal the server's `PROTOCOL_VERSION` (currently 3). Mismatch → `Rejected { reason: "protocol version mismatch" }`.
+- `protocol_version` must equal the server's `PROTOCOL_VERSION` (currently 4). Mismatch → `Rejected { reason: "protocol version mismatch" }`.
 - `username` is 3–24 ASCII bytes, alphanumeric / `_` / `-` / `.`, must start alphanumeric. See `is_valid_username`. Failure → `Rejected { reason: "invalid username" }`.
 - `email` matches a lightweight shape check (`is_valid_email`): non-empty local part, exactly one `@`, dot in domain, no whitespace, length 3–254. Failure → `Rejected { reason: "invalid email" }`.
 - `password` length is 8–128 bytes (`is_valid_password`). Failure → `Rejected { reason: "invalid password" }`.
@@ -424,6 +424,44 @@ If the player is **currently seated and in a live hand** at the moment of the ne
 
 **Known limitation (as of protocol v3).** The current hand's `HoleCardsDealt` is **not** replayed to the reconnecting client. The new device plays the rest of the hand with cards face-down on its UI, but is otherwise fully synced (subsequent `BoardDealt`, `ActionTaken`, and the eventual `HandEnded` all arrive normally, and `HandEnded`'s per-recipient filter still surfaces the player's own hole cards). Full state-replay is on the roadmap.
 
+As of **protocol v4** a reconnecting client can opt into a full mid-hand replay via `RequestReplay` (§ 6.3), which restores `HoleCardsDealt` and every other prior event for that seat.
+
+### 6.3 Full mid-hand replay (v4+)
+
+After a reconnect (§ 6.1) a seated client MAY ask the server for every `ServerMessage` it would have received this hand by sending:
+
+```
+ClientMessage::RequestReplay { hand_id: HandId }   // HandId = u64
+```
+
+The server validates:
+
+1. The connection is currently seated at a table (i.e. the session has a `JoinedTable`).
+2. The `hand_id` matches the table's **current** in-flight hand.
+
+On failure the server replies `ActionRejected { reason: "not seated at this hand" }`. This includes the case where the hand has ended and been torn down: once `HandEnded` has been emitted and the `HandRunner` is dropped, the per-seat replay buffer is gone, and a late `RequestReplay` for that hand id is rejected just like any other stale hand.
+
+On success the server replies:
+
+```
+ServerMessage::ReplayEvents {
+    hand_id: HandId,                  // echoes the request
+    events:  Vec<ServerMessage>,      // ordered, per-seat, masking preserved
+}
+```
+
+`events` is **byte-identical to what that seat received live** — the server does not recompute hole-card masking at replay time; it stores the already-masked `ServerMessage`s as they were emitted. Consequently:
+
+- The replaying seat's own `HoleCardsDealt` appears in `events`; no other seat's does.
+- `BoardDealt`, `ActionTaken`, `PlayerAllIn` etc. appear exactly once each.
+- Any `Prompt` messages addressed to this seat appear in-stream at their original point; the client's state machine should treat these idempotently (the live prompt, if any, is still authoritative).
+
+**Ordering guarantee.** `ReplayEvents` is produced synchronously under the same lock the table actor holds while fanning live events. Therefore every event in the replay strictly precedes every subsequent live `TableEvent` / `Prompt` / etc. delivered to that seat's socket. No live event will ever be duplicated as part of a replay.
+
+**Idempotency on the client.** Clients MAY receive `ReplayEvents` even if they already saw some or all of the contained events live (e.g. brief disconnect without losing the TCP socket's in-flight bytes on the receiving side). The `poker-client-core` state machine is deterministic and idempotent: feeding the same event twice lands on the same state, so a client MUST NOT filter "already seen" events — just play the replay through in order.
+
+**Non-goals.** `RequestReplay` does not work for completed hands; it is strictly an aid for mid-hand reconnection. A history viewer is a future feature.
+
 ### 6.2 Concurrent-session policy
 
 Only one live session per user. A second successful `Authenticate` (in any mode) revokes the prior session. The replaced connection receives `Goodbye { reason: "session revoked" }`. There is no message-level "kick another device" verb; reconnecting from the new device is itself the signal.
@@ -433,7 +471,7 @@ Only one live session per user. A second successful `Authenticate` (in any mode)
 ## 7. Versioning and compatibility
 
 - `PROTOCOL_VERSION` is bumped on any backwards-incompatible change to message shapes — this includes adding required fields, removing fields, renaming variants, and changing field types. Adding optional fields that default cleanly under `serde_derive` is also a bump unless explicitly designed to be wire-compatible.
-- The server sends its `PROTOCOL_VERSION` in `Welcome` and `Rejected`. Clients **should** refuse to proceed against a mismatched version: a client built for v3 talking to a v4 server will see `Rejected { reason: "protocol version mismatch" }`; a v4 client talking to a v3 server will likewise be told.
+- The server sends its `PROTOCOL_VERSION` in `Welcome` and `Rejected`. Clients **should** refuse to proceed against a mismatched version: a client built for v4 talking to a v5 server will see `Rejected { reason: "protocol version mismatch" }`; a v5 client talking to a v4 server will likewise be told.
 - Within a single major version, no message reorderings or semantic shifts are permitted.
 
 ---
@@ -466,6 +504,8 @@ Field-by-field msgpack shape for every message variant.
 {"SubmitAction": [ u32,            // table_id
                    u64,            // hand_id
                    <Action> ]      // action
+}
+{"RequestReplay": [ u64 ]          // hand_id
 }
 "Heartbeat"
 "Disconnect"
@@ -524,6 +564,12 @@ Field-by-field msgpack shape for every message variant.
                      u32 ]                 // deadline_ms
 }
 {"ActionRejected": [ string ]              // reason
+}
+{"ReplayEvents":   [ u64,                  // hand_id
+                     [<ServerMessage>] ]   // events (nested — each entry
+                                           //         is itself a variant-
+                                           //         tagged ServerMessage
+                                           //         per § 1.3)
 }
 "Heartbeat"
 {"Goodbye":        [ string ]              // reason

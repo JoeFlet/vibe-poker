@@ -1,23 +1,6 @@
 # server-protocol
 
-## Purpose
-
-Define wire protocol requirements for framing, message encoding, and connection lifecycle. Applies to poker-server and any connecting client.
-## Requirements
-### Requirement: Length-prefixed msgpack framing
-Every message on the wire SHALL be encoded as a single `[u32 LE length][msgpack payload]` frame. The length SHALL give the exact payload size in bytes. Partial frames SHALL be treated as an error.
-
-#### Scenario: Valid frame round-trip
-- **GIVEN** a `ServerMessage::Welcome` value
-- **WHEN** it is encoded via `frame::encode` and decoded via `frame::decode::<ServerMessage>`
-- **THEN** the decoded value SHALL equal the original
-- **AND** no field names SHALL appear in the wire bytes (positional array encoding)
-
-#### Scenario: Oversized length prefix rejected
-- **GIVEN** a 4-byte length prefix whose value exceeds `MAX_FRAME_BYTES` (4 MiB)
-- **WHEN** the server parses the prefix
-- **THEN** the connection SHALL be torn down immediately
-- **AND** no payload buffer SHALL be allocated
+## MODIFIED Requirements
 
 ### Requirement: Protocol version lockstep
 `PROTOCOL_VERSION` SHALL be bumped on any backwards-incompatible change to `ClientMessage` or `ServerMessage` variants, field ordering, or semantics. The server SHALL reject connections whose claimed protocol version does not match.
@@ -43,14 +26,7 @@ All enum variants SHALL encode by variant name. Struct-variant payloads SHALL se
 - **THEN** the result SHALL be a single-key map `{"RequestReplay": [hand_id]}`
 - **AND** the `hand_id` SHALL encode as a bare msgpack integer inside a 1-element fixarray
 
-### Requirement: Card encoding
-A `Card` SHALL serialize as a single byte `0–51` computed as `(rank << 2) | suit`, where rank `0 = Two` through `12 = Ace` and suit `0 = Clubs`, `1 = Diamonds`, `2 = Hearts`, `3 = Spades`.
-
-#### Scenario: Round-trip card encoding
-- **GIVEN** the Ace of Spades (`rank = 12`, `suit = 3`)
-- **WHEN** encoded and decoded
-- **THEN** the byte SHALL be `51` (`0x33`)
-- **AND** decoded back to the original rank and suit
+## ADDED Requirements
 
 ### Requirement: RequestReplay verb
 `ClientMessage` SHALL include a `RequestReplay { hand_id: HandId }` variant, where `HandId` is the protocol's `u64` hand identifier. A client MAY send this at any time after seating to request the event history for an in-flight hand.
@@ -75,4 +51,3 @@ A `Card` SHALL serialize as a single byte `0–51` computed as `(rank << 2) | su
 - **WHEN** that seat sends `RequestReplay`
 - **THEN** the client SHALL receive all 10 replayed events before any subsequent live broadcast
 - **AND** no live event SHALL be duplicated in the replay
-
