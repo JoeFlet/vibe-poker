@@ -1,0 +1,48 @@
+schema: spec-driven
+
+# Project context — shown to AI when creating artifacts.
+# This defines workspace-wide conventions, tech stack, and domain knowledge.
+context: |
+  ## Workspace
+  Rust Cargo workspace with 7 crates under crates/ and workspace-root tests/.
+  The playable desktop client is a SolidJS / Tauri 2 shell in client/ (git submodule,
+  not in parent Cargo workspace).
+
+  ## Tech stack
+  - Rust 2024 edition, resolver = "2"
+  - Async: tokio (server + transport), sync everything else
+  - DB: SQLite via sqlx with embedded migrations
+  - Auth: Argon2id password hashes, session keys
+  - Serialization: rmp-serde (msgpack) for wire and FileSink logs
+  - UI shell: Tauri 2 + SolidJS + Vite + TypeScript + pnpm
+
+  ## Domain
+  Texas Hold'em rules engine. u32 chips, BB-denominated, no floats anywhere.
+  Determinism via deck_seed. Hole-card masking enforced by server BroadcastSink.
+
+  ## Critical invariants
+  - deck_seed is the sole source of deal entropy.
+  - PROTOCOL_VERSION = 3; bump on any backwards-incompatible wire change.
+  - Integer chips only: u32 for stacks/bets, i32 for chip_delta.
+
+  ## Capability specs (openspec/specs/)
+  - engine-rules: core game invariants (determinism, chips, hole-card privacy)
+  - server-protocol: wire framing, msgpack encoding, protocol versioning
+  - server-behavior: auth, persistence, broadcast masking, reconnect, limits
+  - client-core: pure sync state machine, ClientView authority, animation budget
+  - client-transport: Transport trait, session store, structured logging
+
+  When working on a specific crate, read the matching capability spec for
+  load-bearing requirements. When a change crosses capability boundaries,
+  update both specs.
+
+# Per-artifact rules
+rules:
+  proposal:
+    - Keep proposals under 500 words
+    - Always include a Non-goals section
+    - Reference the relevant capability specs in the Capabilities section
+  tasks:
+    - Break tasks into chunks that can be verified independently
+    - Every task must mention at least one test command
+    - Tasks that touch a capability spec must include "Update openspec/specs/<name>/spec.md"

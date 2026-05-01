@@ -1,8 +1,6 @@
 # poker
 
-A Cargo workspace for a high-performance Texas Hold'em **rules engine**, an **MCCFR agent trainer** built on top, and a **live TCP poker server**. The playable desktop client is split between in-tree Rust crates (state machine + transport + headless test harness) and a SolidJS / Tauri 2 shell in the `client/` git submodule.
-
-Architectural principles for the client live at [docs/CLIENT_PRINCIPLES.md](docs/CLIENT_PRINCIPLES.md).
+A Cargo workspace for a high-performance Texas Hold'em **rules engine**, an **MCCFR agent trainer**, and a **live TCP poker server**. The playable desktop client is a SolidJS / Tauri 2 shell in the `client/` git submodule backed by in-tree Rust crates (state machine + transport + headless test harness).
 
 ## Crates at a glance
 
@@ -15,14 +13,11 @@ Architectural principles for the client live at [docs/CLIENT_PRINCIPLES.md](docs
 | [crates/poker-client-transport-native](crates/poker-client-transport-native/) | Tokio TCP transport + filesystem session-key persistence; `NativeClient` runtime facade | Stable |
 | [crates/poker-client-headless](crates/poker-client-headless/) | `HeadlessClient`, `InMemoryTransport`, scripted scenario driver, CLI scenario replayer | Stable |
 | [client/](client/) (submodule) | Tauri 2 + SolidJS + Vite + TypeScript desktop shell | Active |
-| [crates/poker-client](crates/poker-client/) | `egui` replay viewer + deprecated live client | **Deprecated** — frozen at `PROTOCOL_VERSION = 3`, smoke-test harness only |
 | [tests/](tests/) | Workspace-root full-flow tests (server in-process + headless client over real TCP) | Active |
 
 Each crate has its own README with the specifics; this document is the cross-cutting view.
 
 ## Quick start: play live
-
-Start the server, then launch the desktop client from the submodule:
 
 ```sh
 # Terminal 1 — server (binds 127.0.0.1:7878 by default)
@@ -36,7 +31,7 @@ pnpm tauri dev      # Vite dev server + Tauri window
 
 Enter `127.0.0.1:7878` in the Connect form, register a username, join the table. A second player can connect from another terminal / machine.
 
-## End-to-end training + replay loop
+## Training loop
 
 ```sh
 # 1. Train a blueprint (MCCFR heads-up, 200 000 iterations)
@@ -47,18 +42,11 @@ cargo run --release -p poker-trainer --bin poker_train -- \
 cargo run --release -p poker-trainer --bin poker_play -- \
     --blueprint blueprint.mp --hands 5000 \
     --agents blueprint,calling --log session.mp
-
-# 3. Replay in the deprecated egui viewer (still functional)
-cargo run --release -p poker-client -- --replay session.mp
 ```
-
-For training-specific flags see the [trainer README](crates/poker-trainer/); for server flags the [server README](crates/poker-server/).
 
 ## Quick stats run (`poker_report`)
 
-For a fast per-seat stat table over N simulated hands without training a blueprint:
-
-```
+```sh
 cargo run --release -p poker_engine -- [OPTIONS]
 
 Options:
@@ -81,8 +69,6 @@ Options:
 
 ## Inter-crate contracts
 
-Three shared formats are the load-bearing seams. Touching any of them is a workspace-wide concern.
-
 ### `EngineEvent` stream
 
 Every meaningful moment in a hand emits an event: `HandStarted` / `HoleCardsDealt` / `BoardDealt` / `ActionTaken` / `PlayerAllIn` / `HandEnded`. The engine stores nothing; events flow into whatever `EventSink` the caller supplies.
@@ -91,13 +77,13 @@ Every meaningful moment in a hand emits an event: `HandStarted` / `HoleCardsDeal
 |---|---|
 | `NullSink` | Bulk training / report runs |
 | `VecSink` | Tests, in-memory capture |
-| `FileSink` | `poker_play --log`, `poker_dataset --out`, replay viewer input |
+| `FileSink` | `poker_play --log`, `poker_dataset --out` |
 | `StatsSink` | `poker_report`, `poker_play` |
 | `BroadcastSink` (server-side) | `poker-server` — fans events to each client with hole-card masking |
 
 ### `FileSink` log format
 
-`[u32 LE length][rmp-serde EngineEvent bytes]` frames written through `BufWriter`. Round-trip with `read_event_log`. The server uses the same framing for hand-log BLOBs in SQLite, so a recorded hand can be replayed unchanged.
+`[u32 LE length][rmp-serde EngineEvent bytes]` frames written through `BufWriter`. Round-trip with `read_event_log`. The server uses the same framing for hand-log BLOBs in SQLite.
 
 ### Wire protocol
 
@@ -115,18 +101,15 @@ Full step-by-step plan lives in [DESIGN.md](DESIGN.md). Summary:
 
 | Steps | What | Status |
 |---|---|---|
-| 1–17 | Engine, sim, stats, MCCFR, blueprints, dataset, egui replay viewer | ✅ |
-| 18 | Persona bot pool (`Nit`, `Tag`, `Lag`, `Maniac`, `TiltProne`) + `poker_dataset` | ✅ |
-| 19a–c | TCP server skeleton, game messages, live client smoke | ✅ |
+| 1–17 | Engine, sim, stats, MCCFR, blueprints, dataset | ✅ |
+| 18 | Persona bot pool + `poker_dataset` | ✅ |
+| 19a–c | TCP server skeleton, game messages | ✅ |
 | 20 | `poker-trainer` split from `poker-engine` | ✅ |
 | 21a–c | SQLite persistence — schema, Argon2id auth, per-hand log storage | ✅ |
 | 22a–c | Security hardening — wire-layer limits, idle timeout, rate-limit, reconnect mid-hand | ✅ |
 | 23 | `PROTOCOL.md` long-form wire spec | ✅ |
-| 24 | Deprecate `poker-client`; per-crate READMEs; root README | ✅ |
-| 25a | `poker-client-core` — pure synchronous state machine | ✅ |
-| 25b | `poker-client-transport-native` — tokio TCP pump + session store + `NativeClient` facade | ✅ |
-| 25c | `poker-client-headless` — `InMemoryTransport`, scenario driver, CLI replayer | ✅ |
-| 25d | `client/` Tauri 2 + SolidJS shell — MVP functional loop | ✅ |
+| 24 | Deprecate old client; per-crate READMEs | ✅ |
+| 25a–d | New client architecture: core, transport, headless, Tauri shell | ✅ |
 | 26 | Server-side hand replay verb (`RequestReplay`), protocol v4 | 🔲 |
 | 27 | Mid-hand persistence atomicity — verify + regression test | 🔲 |
 

@@ -11,8 +11,8 @@
 //!    time-correlated drift (e.g., post-loss VPIP inflation in the
 //!    `tilt` persona).
 //!
-//! With `--out <dir>`, raw matchup logs are written as `FileSink` files so
-//! the same data can be replayed in `poker-client` or re-analysed offline.
+//! With `--out <dir>`, raw matchup logs are written as `FileSink` files for
+//! offline replay or re-aggregation.
 
 use std::fs;
 use std::path::PathBuf;

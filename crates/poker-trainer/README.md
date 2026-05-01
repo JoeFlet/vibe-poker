@@ -33,12 +33,7 @@ cargo run --release -p poker-trainer --bin poker_play -- \
 
 ## Replaying a session
 
-A `--log` file from `poker_play` or `poker_dataset` can be replayed:
-
-- **Desktop client** ([client/](../../client/)): load via file picker once a replay UI lands (step 26+).
-- **Deprecated egui viewer** ([poker-client](../poker-client/)): `cargo run -p poker-client -- --replay session.mp`
-
-Both consume the same `[u32 LE length][rmp-serde EngineEvent]` frame format.
+A `--log` file from `poker_play` or `poker_dataset` is a standard `FileSink` log (`[u32 LE length][rmp-serde EngineEvent]` frames). It can be re-aggregated by the dataset API or replayed by any tool that reads the format.
 
 ## Persona dataset
 

@@ -661,9 +661,7 @@ serving as the schema source of truth.
     a per-persona summary, the (own × opponent) class-conditional matrix
     (VPIP / PFR / AF / WTSD / chip EV), and rolling-window time series for
     each persona; with `--out <dir>` it also dumps the raw `FileSink` logs
-    so every matchup can be replayed in `poker-client`. Future client/server
-    traffic captured to the same `FileSink` format slots in unchanged.
-    Importing external hand histories is a later option, not a prerequisite. ✅
+importing external hand histories is a later option, not a prerequisite. ✅
 18. **Exploit layer** — opponent profiling consumer on `EngineEvent`
     using the stat schema validated in step 17, plus best-response mixing
     with the MCCFR blueprint. Mixing weight trades exploitation against
@@ -696,28 +694,9 @@ serving as the schema source of truth.
       for non-recipients except at proper showdowns (river dealt with
       ≥2 contenders). Two TCP integration tests cover fold-through
       (no leaks) and check/call-to-showdown (both hands revealed). ✅
-    - **19c — live client.** `poker-client` grew a tokio-backed
-      `LiveClient` worker thread bridged to egui via paired mpsc
-      channels. New `LiveApp` egui state machine: Connecting → Lobby
-      (table picker with refresh + buy-in input) → Seated (snapshot
-      view, seat list with stacks, action panel that lights up on
-      `Prompt`). The seated view reuses the step-16 `Snapshot` /
-      `render_snapshot` pipeline, fed event-by-event from inbound
-      `TableEvent`s. Action panel issues `SubmitAction` for
-      fold/check/call/all-in, plus a min/max-bounded raise slider.
-      One in-process smoke test drives the worker through Hello →
-      Welcome → ListTables → TableList against the same `ServerContext`
-      the 19b TCP tests use. ✅
+    - **19c — live client smoke.** First playable egui client. Superseded by the Tauri client in step 25d. ✅
 
-22. **Project pivot — 2026-04-28.** With the live-client smoke working,
-    the project's centre of gravity has shifted from "engine for
-    training" to **"poker server, with engine + agent training as
-    library dependencies, and a deprecated reference client."** The
-    next-generation client will be built as a separate (likely
-    non-Rust) project and consumes a documented wire protocol. This
-    repo's remaining work is therefore a refactor + server hardening
-    pass, captured in steps 20–24 below. Step 19d (per-player stat
-    persistence) is subsumed by the broader DB work in step 21c.
+22. **Project pivot — 2026-04-28.** Shifted from "engine for training" to **poker server with engine + trainer as library dependencies**. Remaining work is server hardening + client rewrite, captured in steps 20–24 below. Step 19d (per-player stat persistence) is subsumed by step 21c.
 
 23. **Step 20 — Trainer split.** Promote agent-training code out of
     `poker-engine` into a new `poker-trainer` crate so the engine stays
@@ -880,10 +859,7 @@ to a new architecture: **Rust state machine core + transport layer
 back in the `client/` submodule (which gets force-reset; the old
 state lives on as the `flutter-experiment` tag in that repo).
 
-The three load-bearing principles that shape this phase live at
-[docs/CLIENT_PRINCIPLES.md](docs/CLIENT_PRINCIPLES.md): strict
-correctness with full-flow tests, thin UI projecting state, and
-resilience to interruption via server-driven resync.
+The three load-bearing principles that shape this phase live in AGENTS.md: strict correctness with full-flow tests, thin UI projecting state, and resilience to interruption via server-driven resync.
 
 28. **Step 25 — Client architecture rewrite.** Multi-crate setup:
     - **25a — `poker-client-core`.** Pure synchronous state machine.
@@ -1028,19 +1004,7 @@ resilience to interruption via server-driven resync.
       compiles + test passes; parent workspace's 250+ tests still
       green.
 
-29. **Step 26 — Server-side hand replay (protocol v4).** Required by
-    principle 3. The server gets a new client verb, working title
-    `RequestReplay { hand_id }`, that replies with the full ordered
-    `EngineEvent` stream for the in-flight hand as the requesting
-    seat would have seen it (their hole cards visible, others
-    masked). Bumps `PROTOCOL_VERSION` to 4 and invalidates v3
-    clients; the in-tree deprecated `crates/poker-client` doesn't
-    get updated — it's a v3 harness for the server's v3 codepath
-    until that codepath is removed. PROTOCOL.md gets a new
-    sub-section under §6 covering the verb's preconditions
-    (recipient must be seated at the named hand), guarantees
-    (events are byte-identical to what the seat originally received),
-    and ordering relative to subsequent live broadcasts.
+29. **Step 26 — Server-side hand replay (protocol v4).** Required by principle 3. The server gets a new client verb, working title `RequestReplay { hand_id }`, that replies with the full ordered `EngineEvent` stream for the in-flight hand as the requesting seat would have seen it (their hole cards visible, others masked). Bumps `PROTOCOL_VERSION` to 4. PROTOCOL.md gets a new sub-section under §6 covering the verb's preconditions (recipient must be seated at the named hand), guarantees (events are byte-identical to what the seat originally received), and ordering relative to subsequent live broadcasts.
 
 30. **Step 27 — Mid-hand persistence atomicity.** Verify and document
     that `Registry::record_hand` only fires at `HandEnded`, that no

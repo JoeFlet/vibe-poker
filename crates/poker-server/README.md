@@ -29,12 +29,6 @@ pnpm tauri dev # opens the desktop window
 
 Enter `127.0.0.1:7878` on the Connect screen, register a username, and join the table.
 
-For a smoke test without the desktop shell, the deprecated in-tree egui client still works:
-
-```sh
-cargo run -p poker-client -- --connect 127.0.0.1:7878 --username alice
-```
-
 Any client built against [PROTOCOL.md](../poker-engine/src/net/PROTOCOL.md) will work — the spec is complete enough to implement a client in any language.
 
 ## Architecture
@@ -62,8 +56,6 @@ State lives in `<data_dir>/poker.sqlite`. Schema is embedded from [migrations/](
 | `lifetime_stats` | Single-row-per-user aggregate (VPIP / PFR / AF / chip delta), updated at `HandEnded` |
 | `hands` | One row per finished hand; `log` BLOB is the same `[u32 LE length][rmp-serde]` framing `FileSink` uses |
 | `hand_seats` | One row per participating seat per hand; chip delta + `sat_out` flag |
-
-`hands.log` can be replayed unchanged by the deprecated [poker-client](../poker-client/) replay viewer or any future tool that reads `FileSink` format.
 
 ## Security / limits
 

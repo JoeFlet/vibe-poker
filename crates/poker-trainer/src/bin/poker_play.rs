@@ -55,7 +55,6 @@ struct Cli {
     seed: u64,
 
     /// Optional path to write a `FileSink` event log (MessagePack framing).
-    /// Open with `poker-client --replay <path>`.
     #[arg(long)]
     log: Option<PathBuf>,
 }

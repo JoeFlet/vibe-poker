@@ -8,7 +8,6 @@ This crate is the foundation every other crate in the workspace builds on:
 - **[poker-server](../poker-server/)** — runs `Engine::run_hand` on `spawn_blocking` to drive remote players.
 - **[poker-client-core](../poker-client-core/)** — pure synchronous client state machine; imports `EngineEvent` and the `net` wire types.
 - **[poker-client-transport-native](../poker-client-transport-native/)** — tokio TCP transport that sends / receives `ClientMessage` / `ServerMessage`.
-- **[poker-client](../poker-client/)** _(deprecated)_ — the old `egui` client; uses `EngineEvent` shapes and `Snapshot` derivation.
 
 ## Public surface
 
