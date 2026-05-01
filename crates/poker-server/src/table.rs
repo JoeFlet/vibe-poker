@@ -393,6 +393,15 @@ pub async fn run_table(table: Arc<Table>, rules: BettingRules, registry: Arc<Reg
         let (result, log) = run_one_hand(&table, &rules, snapshot, deck_seed).await;
         let ended_at = unix_now();
         apply_hand_result(&table, &result).await;
+        // INVARIANT (mid-hand atomicity): `persist_hand` is called ONLY
+        // after `run_one_hand` returns, which happens ONLY after the
+        // engine emits `HandEnded` (seen by `BroadcastSink::on_event`).
+        // If this actor task is aborted or the server crashes before
+        // this line, the DB contains no evidence of the hand — see
+        // `Registry::record_hand` for the transactional guarantee and
+        // `tests/persistence.rs::abort_mid_hand_leaves_db_clean` for
+        // the regression pin. Do NOT move any persistence write above
+        // this point without updating the spec + test.
         persist_hand(&registry, &table, started_at, ended_at, log, &result, &player_ids)
             .await;
 
@@ -825,12 +834,20 @@ impl TableManager {
     }
 
     /// Register an already-constructed table and spawn its actor.
-    pub async fn install(&self, table: Arc<Table>, rules: BettingRules, registry: Arc<Registry>) {
+    /// Returns the actor's `JoinHandle` so callers (and tests) can
+    /// abort or `await` it; production callers can simply drop the
+    /// handle.
+    pub async fn install(
+        &self,
+        table: Arc<Table>,
+        rules: BettingRules,
+        registry: Arc<Registry>,
+    ) -> tokio::task::JoinHandle<()> {
         {
             let mut inner = self.inner.write().await;
             inner.tables.insert(table.id, Arc::clone(&table));
         }
-        tokio::spawn(run_table(table, rules, registry));
+        tokio::spawn(run_table(table, rules, registry))
     }
 
     pub async fn list_infos(&self) -> Vec<TableInfo> {

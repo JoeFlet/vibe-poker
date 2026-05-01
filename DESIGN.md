@@ -1006,14 +1006,21 @@ The three load-bearing principles that shape this phase live in AGENTS.md: stric
 
 29. **Step 26 — Server-side hand replay (protocol v4).** Required by principle 3. The server gets a new client verb, working title `RequestReplay { hand_id }`, that replies with the full ordered `EngineEvent` stream for the in-flight hand as the requesting seat would have seen it (their hole cards visible, others masked). Bumps `PROTOCOL_VERSION` to 4. PROTOCOL.md gets a new sub-section under §6 covering the verb's preconditions (recipient must be seated at the named hand), guarantees (events are byte-identical to what the seat originally received), and ordering relative to subsequent live broadcasts.
 
-30. **Step 27 — Mid-hand persistence atomicity.** Verify and document
-    that `Registry::record_hand` only fires at `HandEnded`, that no
-    chip movement is reflected in `lifetime_stats` or `hands` /
-    `hand_seats` until then, and that a server restart mid-hand
-    leaves the database in a state indistinguishable from "the hand
-    never started." Add a stress test that crashes the server-task
-    mid-hand and asserts no SQLite mutation occurred. Likely a
-    documentation-only step (the current implementation already
-    holds the invariant), but pinned with a regression test so a
-    future "incremental stat update" optimisation can't silently
-    break it.
+30. **Step 27 — Mid-hand persistence atomicity.** ✅ Done (2026-05-01).
+    Verified and documented that `Registry::record_hand` only fires at
+    `HandEnded`, that no chip movement is reflected in `lifetime_stats`
+    or `hands` / `hand_seats` until then, and that a server restart
+    mid-hand leaves the database in a state indistinguishable from "the
+    hand never started." `INVARIANT:` comments pin the call-site
+    contract on both `record_hand` and the `persist_hand` call in
+    `run_table`. Regression test
+    `abort_mid_hand_leaves_db_clean` in
+    [crates/poker-server/tests/persistence.rs](crates/poker-server/tests/persistence.rs)
+    aborts the table actor mid-hand (after `HandStarted` reaches a
+    client, before `HandEnded`) and asserts both `count_hands() == 0`
+    and that a re-authenticated player's `lifetime_stats` are unchanged.
+    The test required exposing the `run_table` `JoinHandle` from
+    `TableManager::install`, a trivial signature change with no
+    production-behavior impact. A future "incremental stat update"
+    optimisation that moves a persistence write ahead of `HandEnded`
+    will trip this test.

@@ -31,6 +31,13 @@ Issuing a new session for a user SHALL revoke the prior live session atomically.
 - **THEN** the database SHALL contain no evidence that the hand ever started
 - **AND** player stacks and stats SHALL match the state from before the hand began
 
+#### Scenario: Table actor aborted mid-hand leaves DB clean
+- **GIVEN** a hand is in progress (clients have received `HandStarted`) but `HandEnded` has not yet been emitted
+- **WHEN** the table actor task is aborted (simulating a mid-hand server crash)
+- **THEN** the `hands` table SHALL contain zero rows for that hand
+- **AND** the `hand_seats` table SHALL contain zero rows for that hand
+- **AND** a subsequent authenticated login SHALL return `lifetime_stats` unchanged from before the hand started
+
 ### Requirement: Hole-card masking per recipient
 `BroadcastSink` SHALL fan `EngineEvent`s per-recipient. `HoleCardsDealt` SHALL travel only to its owning seat. `HandEnded` SHALL mask all hole cards for non-owner recipients except at proper showdown.
 

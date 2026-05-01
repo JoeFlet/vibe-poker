@@ -398,6 +398,17 @@ impl Registry {
     /// Persist one finished hand: a row in `hands` carrying the full
     /// `FileSink`-compatible event log, plus one row per participating
     /// seat in `hand_seats`. Returns the inserted `hands.id`.
+    ///
+    /// INVARIANT (mid-hand atomicity): this MUST only be called after
+    /// the engine has emitted `HandEnded`. No partial write is possible
+    /// — the entire insert (header row + all seat rows) runs inside one
+    /// SQLite transaction, so either every row lands or none do. A
+    /// server crash mid-hand (before `HandEnded`) MUST leave the DB
+    /// indistinguishable from "the hand never started". Enforced by
+    /// the call sequence in `crates/poker-server/src/table.rs::run_table`:
+    /// `run_one_hand` returns only after `HandEnded`, and `persist_hand`
+    /// (→ this function) is the next call. Regression pinned by
+    /// `tests/persistence.rs::abort_mid_hand_leaves_db_clean`.
     pub async fn record_hand(
         &self,
         table_id: TableId,

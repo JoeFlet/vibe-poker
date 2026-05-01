@@ -29,6 +29,18 @@ use poker_server::{
 const T: Duration = Duration::from_secs(10);
 
 async fn spawn_server() -> (std::net::SocketAddr, Arc<Registry>, tempfile::TempDir) {
+    let (addr, registry, dir, _handle) = spawn_server_with_handle().await;
+    (addr, registry, dir)
+}
+
+/// Variant of [`spawn_server`] that also returns the table-actor
+/// `JoinHandle`, so tests can abort it to simulate a mid-hand crash.
+async fn spawn_server_with_handle() -> (
+    std::net::SocketAddr,
+    Arc<Registry>,
+    tempfile::TempDir,
+    tokio::task::JoinHandle<()>,
+) {
     let dir = tempdir().unwrap();
     let registry = Arc::new(Registry::open(dir.path()).await.unwrap());
 
@@ -44,7 +56,7 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<Registry>, tempfile::TempD
     };
     let rules = BettingRules::no_limit_holdem(cfg.small_blind, cfg.big_blind, cfg.max_seats as usize);
     let tables = TableManager::new();
-    tables
+    let handle = tables
         .install(Table::new(1, cfg), rules, Arc::clone(&registry))
         .await;
     let ctx = ServerContext {
@@ -65,7 +77,7 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<Registry>, tempfile::TempD
             tokio::spawn(async move { handle_connection(stream, peer, ctx).await });
         }
     });
-    (addr, registry, dir)
+    (addr, registry, dir, handle)
 }
 
 async fn register_and_join(addr: std::net::SocketAddr, name: &str) -> TcpStream {
@@ -181,4 +193,100 @@ fn decode_log(bytes: &[u8]) -> Vec<EngineEvent> {
     }
     assert_eq!(i, bytes.len(), "trailing bytes in log");
     out
+}
+
+/// Step 27 regression: aborting the table actor mid-hand MUST leave
+/// the DB indistinguishable from "the hand never started". This pins
+/// the `record_hand` call-site contract — any future optimisation
+/// that moves a persistence write ahead of `HandEnded` will trip this.
+#[tokio::test]
+async fn abort_mid_hand_leaves_db_clean() {
+    let (addr, registry, _guard, handle) = spawn_server_with_handle().await;
+
+    // Register + seat both players. After the second joins, quorum is
+    // met and the table actor starts a hand.
+    let alice = register_and_join(addr, "alice").await;
+    let bob = register_and_join(addr, "bob").await;
+
+    // Drive both clients until one of them sees `HandStarted` — proof
+    // that the actor is inside `run_one_hand` and no `HandEnded` has
+    // been emitted yet. Don't answer any `Prompt` (leave the hand
+    // mid-flight). Keep both streams alive until the end of the test
+    // so the server's connection-teardown paths don't mask the
+    // persistence signal.
+    let alice = wait_for_hand_started(alice).await;
+
+    // Simulate a server crash: abort the table-actor task. The
+    // `spawn_blocking` hand task is uncancellable and will run to
+    // completion, but the `run_one_hand.await` inside `run_table` is
+    // dropped along with the rest of the actor's future, so
+    // `persist_hand` (the only caller of `Registry::record_hand`) is
+    // never reached.
+    handle.abort();
+    let _ = handle.await; // swallow the JoinError from the abort.
+
+    // Hold both client streams open so the server's connection-
+    // teardown paths don't kick in and mask whether the persistence
+    // side did its job.
+    let _alice_guard = alice;
+    let _bob_guard = bob;
+
+    // Give any in-flight blocking task a generous window to finish.
+    // The design pins this at 200ms; a full heads-up hand off random
+    // cards is well under that on CI, so if `record_hand` were going
+    // to be called we'd see it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let hands = registry
+        .count_hands()
+        .await
+        .expect("count_hands must succeed");
+    assert_eq!(
+        hands, 0,
+        "aborted-mid-hand server must leave `hands` table empty, got {hands} rows",
+    );
+
+    // And: a re-authentication of one of the players returns the
+    // default (zero) lifetime stats — the mid-hand abort MUST NOT have
+    // moved any aggregates. (Current implementation doesn't touch
+    // `lifetime_stats` from `record_hand` at all; this assertion
+    // future-proofs the invariant against any such change.)
+    // `authenticate_password` revokes any prior live session in the
+    // same transaction, so alice being "online" from registration
+    // doesn't block this.
+    let reauth = registry
+        .authenticate_password("alice", "hunter2hunter", None)
+        .await
+        .expect("alice should re-auth cleanly");
+    assert_eq!(
+        reauth.record.stats.hands, 0,
+        "lifetime_stats.hands must be unchanged after mid-hand abort",
+    );
+    assert_eq!(
+        reauth.record.stats.chip_delta, 0,
+        "lifetime_stats.chip_delta must be unchanged after mid-hand abort",
+    );
+}
+
+/// Read from `stream` until a `TableEvent(HandStarted)` arrives, then
+/// return the stream so the caller can hold it open. Panics on
+/// timeout or wire error.
+async fn wait_for_hand_started(mut stream: TcpStream) -> TcpStream {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (mut read, _write) = stream.split();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let msg: ServerMessage = match timeout(remaining, read_message(&mut read)).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => panic!("wire error waiting for HandStarted: {e:?}"),
+            Err(_) => panic!("timed out waiting for HandStarted"),
+        };
+        if let ServerMessage::TableEvent {
+            event: EngineEvent::HandStarted { .. },
+            ..
+        } = msg
+        {
+            return stream;
+        }
+    }
 }
