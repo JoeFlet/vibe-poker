@@ -41,6 +41,9 @@ cargo run --release -p poker-trainer --bin poker_play -- --blueprint bp.mp --han
 # 3. Live server + Tauri client
 cargo run -p poker-server                       # 127.0.0.1:7878
 cd client && pnpm install && pnpm tauri dev     # separate terminal
+
+# 4. Two local clients against one server (testing only, see client/README.md)
+cd client && pnpm tauri:p2                      # second window, identifier com.poker.client.p2
 ```
 
 ## Design Authority

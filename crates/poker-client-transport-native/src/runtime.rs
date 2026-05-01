@@ -126,6 +126,20 @@ impl NativeClient {
         self.view_rx.borrow().clone()
     }
 
+    /// Clone the underlying watch receiver so a host event pump can
+    /// `await changed()` instead of polling `snapshot()`. Each
+    /// receiver tracks its own "seen" flag so multiple pumps can
+    /// observe changes independently.
+    ///
+    /// Used by the Tauri shell's `spawn_event_pump` to emit
+    /// `snapshot_changed` Tauri events only when the view actually
+    /// advances — the previous fixed-20 ms cadence churned the
+    /// SolidJS `For` reconciler on every tick and invalidated DOM
+    /// event bindings on buttons rendered inside the list.
+    pub fn view_receiver(&self) -> watch::Receiver<ClientView> {
+        self.view_rx.clone()
+    }
+
     /// Drain accumulated log entries since the previous call. Each
     /// entry was also handed to `tracing` at its native level.
     pub fn drain_logs(&self) -> Vec<LogEntry> {
@@ -138,6 +152,18 @@ impl NativeClient {
     /// on startup without going through the full intent/effect flow.
     pub fn session_key(&self) -> Option<String> {
         self.session_store.load().ok().flatten()
+    }
+
+    /// Delete any persisted session key from disk. Used by hosts
+    /// that want to force the user back to an interactive login
+    /// (e.g. a "log out" / "change server" action) without having
+    /// to route a ClientMessage through the worker loop.
+    ///
+    /// Note: this does NOT issue `Intent::Disconnect` or touch
+    /// the in-memory core state. Callers that want both should
+    /// issue `Intent::Disconnect` separately.
+    pub fn clear_session(&self) -> std::io::Result<()> {
+        self.session_store.clear()
     }
 }
 
