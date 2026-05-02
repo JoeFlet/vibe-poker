@@ -14,6 +14,7 @@
 //! side then yields an error, and we fold for the player.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::runtime::Handle;
@@ -51,6 +52,17 @@ impl Agent for RemoteAgent {
         // Resolve the seat's CURRENT connection. After a reconnect
         // (step 22c) this is the new socket; the previous one is gone.
         let conn = self.link.current();
+
+        // Fast-fold: if the connection has been marked as departed
+        // (LeaveTable or non-superseded session close), skip the prompt
+        // and fold immediately to avoid stalling the engine for the
+        // full action deadline. See server-behavior spec: "Force-fold
+        // on mid-hand leave".
+        if conn.departed.load(Ordering::Acquire) {
+            debug!(player_id = conn.player_id, "remote agent: connection departed, fast-folding");
+            return Action::Fold;
+        }
+
         let pending = PendingAction {
             table_id: self.table_id,
             hand_id: self.current_hand,

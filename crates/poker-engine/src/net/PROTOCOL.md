@@ -2,7 +2,7 @@
 
 This document specifies the wire protocol implemented by [`poker-server`](../../../poker-server/) and consumed by clients (the in-tree `poker-client` plus any future client). It is sufficient to build a non-Rust client without reading server source.
 
-It is versioned in lockstep with [`PROTOCOL_VERSION`](protocol.rs) (defined in [`protocol.rs`](protocol.rs)). The current version is **4**.
+It is versioned in lockstep with [`PROTOCOL_VERSION`](protocol.rs) (defined in [`protocol.rs`](protocol.rs)). The current version is **5**.
 
 The Rust types in [`protocol.rs`](protocol.rs) are the canonical schema. This file describes how those types are framed, sequenced, and interpreted on the wire.
 
@@ -118,7 +118,7 @@ ClientMessage::Register {
 
 Server-side validation:
 
-- `protocol_version` must equal the server's `PROTOCOL_VERSION` (currently 4). Mismatch → `Rejected { reason: "protocol version mismatch" }`.
+- `protocol_version` must equal the server's `PROTOCOL_VERSION` (currently 5). Mismatch → `Rejected { reason: "protocol version mismatch" }`.
 - `username` is 3–24 ASCII bytes, alphanumeric / `_` / `-` / `.`, must start alphanumeric. See `is_valid_username`. Failure → `Rejected { reason: "invalid username" }`.
 - `email` matches a lightweight shape check (`is_valid_email`): non-empty local part, exactly one `@`, dot in domain, no whitespace, length 3–254. Failure → `Rejected { reason: "invalid email" }`.
 - `password` length is 8–128 bytes (`is_valid_password`). Failure → `Rejected { reason: "invalid password" }`.
@@ -237,7 +237,11 @@ ClientMessage::LeaveTable { table_id: TableId }
 ServerMessage::LeftTable   { table_id: TableId }
 ```
 
-Effect is at the next hand boundary; the current hand (if the player is in one) plays out. Existing seats receive a follow-up `TableState`.
+**Protocol v5 semantics (breaking change from v4):** `LeaveTable` during a live hand now immediately force-folds the seat. The server cancels any in-flight action prompt for the leaver before marking the seat `leave_pending = true`. This eliminates the ~30-second action-deadline stall that occurred under v4. The leaver receives `LeftTable` immediately; remaining seats see `ActionTaken { action: Fold }` broadcast by the engine shortly after.
+
+If the hand is NOT in progress, the seat vacates at the next hand boundary as before.
+
+Existing seats receive a follow-up `TableState` after `LeftTable`.
 
 ### 4.2 Seated
 
@@ -471,7 +475,7 @@ Only one live session per user. A second successful `Authenticate` (in any mode)
 ## 7. Versioning and compatibility
 
 - `PROTOCOL_VERSION` is bumped on any backwards-incompatible change to message shapes — this includes adding required fields, removing fields, renaming variants, and changing field types. Adding optional fields that default cleanly under `serde_derive` is also a bump unless explicitly designed to be wire-compatible.
-- The server sends its `PROTOCOL_VERSION` in `Welcome` and `Rejected`. Clients **should** refuse to proceed against a mismatched version: a client built for v4 talking to a v5 server will see `Rejected { reason: "protocol version mismatch" }`; a v5 client talking to a v4 server will likewise be told.
+- The server sends its `PROTOCOL_VERSION` in `Welcome` and `Rejected`. Clients **should** refuse to proceed against a mismatched version: a client built for v5 talking to a v4 server will see `Rejected { reason: "protocol version mismatch" }`; a v4 client talking to a v5 server will likewise be told.
 - Within a single major version, no message reorderings or semantic shifts are permitted.
 
 ---

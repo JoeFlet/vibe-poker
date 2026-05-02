@@ -10,6 +10,7 @@
 
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, oneshot};
@@ -52,6 +53,12 @@ pub struct Connection {
     /// (not tokio) so the engine's blocking `act()` can lock it
     /// without an async runtime.
     pub pending: StdMutex<Option<PendingAction>>,
+    /// Set to `true` when the player has sent `LeaveTable` (or the
+    /// session is closing non-superseded). `RemoteAgent::act` checks
+    /// this flag before blocking on the response oneshot: if set, it
+    /// returns `Fold` immediately without waiting, eliminating the
+    /// ~5s action-deadline stall even for non-acting-at-leave players.
+    pub departed: AtomicBool,
 }
 
 impl Connection {
@@ -68,6 +75,7 @@ impl Connection {
                 session_id,
                 out_tx,
                 pending: StdMutex::new(None),
+                departed: AtomicBool::new(false),
             },
             out_rx,
         )
@@ -105,10 +113,14 @@ impl Connection {
         pending.responder.send(action).is_ok()
     }
 
-    /// Drop any in-flight prompt without resolving it. Used on
-    /// disconnect so the engine's blocking `act()` returns instead
-    /// of waiting forever.
+    /// Drop any in-flight prompt without resolving it, and mark the
+    /// connection as departed so future `RemoteAgent::act` calls fold
+    /// immediately rather than waiting for the action deadline.
+    ///
+    /// Called on `LeaveTable` (via `handle_leave`) and on non-superseded
+    /// session close, before `force_leave`. Safe to call multiple times.
     pub fn cancel_pending(&self) {
+        self.departed.store(true, Ordering::Release);
         let mut slot = self.pending.lock().expect("pending mutex poisoned");
         if let Some(p) = slot.take() {
             // Sending `Fold` here would race the timeout path; just

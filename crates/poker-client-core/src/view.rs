@@ -108,6 +108,12 @@ pub struct CurrentHand {
     /// Server-asserted action deadline in milliseconds, sampled at
     /// the moment the prompt was issued. `None` when not awaiting.
     pub action_deadline_ms: Option<u32>,
+    /// Per-seat amount committed this street, reconstructed from
+    /// `EngineEvent::ActionTaken` and `EngineEvent::PlayerAllIn`.
+    /// Reset on `HandStarted` (via `CurrentHand::started`) and on
+    /// `BoardDealt` (new street). This is a UI affordance only; the
+    /// authoritative pot total is `pot_total`.
+    pub bet_this_street: Vec<(usize, u32)>,
 }
 
 impl ClientView {
@@ -148,6 +154,7 @@ impl CurrentHand {
             awaiting_action: false,
             legal_actions: None,
             action_deadline_ms: None,
+            bet_this_street: Vec::new(),
         }
     }
 }

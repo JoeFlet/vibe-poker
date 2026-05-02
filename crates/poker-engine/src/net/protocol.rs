@@ -6,7 +6,7 @@
 //! by [`super::frame`]; whether they ride TCP, WebSockets, or an
 //! in-process channel is the caller's choice.
 //!
-//! Handshake (PROTOCOL_VERSION 4): the first message on a fresh
+//! Handshake (PROTOCOL_VERSION 5): the first message on a fresh
 //! connection is either [`ClientMessage::Register`] (account creation)
 //! or [`ClientMessage::Authenticate`] (existing account, by password
 //! or session key). Both succeed with [`ServerMessage::Welcome`]
@@ -24,7 +24,7 @@ use crate::game::{Action, EngineEvent, HandId, LegalActions, SeatIndex};
 /// Bumped on any backwards-incompatible change to message shapes.
 /// The server sends its version in `Welcome` / `Rejected`; clients
 /// SHOULD refuse to proceed against a mismatched major version.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Stable identifier for a poker table. Allocated by the server.
 pub type TableId = u32;

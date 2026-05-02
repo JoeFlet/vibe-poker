@@ -254,6 +254,11 @@ impl Table {
     /// Mark the player's seat as leaving. If a hand is in progress
     /// they finish it; otherwise they're removed immediately.
     /// Caller is responsible for any post-leave broadcast.
+    ///
+    /// **When mid-hand, caller MUST also call `cancel_pending` on the
+    /// leaver's `Connection` to force-fold; `leave_pending=true` alone
+    /// does not affect the engine — the engine still waits on
+    /// `RemoteAgent::act` until the pending slot is dropped.**
     pub async fn leave(&self, player_id: PlayerId) -> Result<(), String> {
         let mut inner = self.state.lock().await;
         let seat_idx = inner

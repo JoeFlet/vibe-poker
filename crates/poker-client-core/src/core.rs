@@ -412,6 +412,8 @@ impl ClientCore {
                     for c in &cards {
                         h.board.push(c.index() as u8);
                     }
+                    // New street: reset per-seat bet projection.
+                    h.bet_this_street.clear();
                     out.push(log(LogLevel::Debug, "core: board dealt",
                         &[("street", format!("{street:?}")),
                           ("cards", cards.len().to_string())]));
@@ -422,6 +424,30 @@ impl ClientCore {
                     h.pot_total = pot_total;
                     if matches!(action, Action::Fold) && !h.folded_seats.contains(&seat) {
                         h.folded_seats.push(seat);
+                    }
+                    // Update per-seat street bet projection (UI affordance only).
+                    match action {
+                        Action::Fold | Action::Check => {
+                            // Fold: entry unchanged (spec says Fold keeps entry).
+                            // Check: set to current max (or 0 if none).
+                            if matches!(action, Action::Check) {
+                                let max = h.bet_this_street.iter().map(|&(_, b)| b).max().unwrap_or(0);
+                                update_bet(&mut h.bet_this_street, seat, max);
+                            }
+                        }
+                        Action::Call => {
+                            // Call: match current maximum bet.
+                            let max = h.bet_this_street.iter().map(|&(_, b)| b).max().unwrap_or(0);
+                            update_bet(&mut h.bet_this_street, seat, max);
+                        }
+                        Action::Raise(to) => {
+                            // Raise(to): set exact amount.
+                            update_bet(&mut h.bet_this_street, seat, to);
+                        }
+                        Action::AllIn => {
+                            // AllIn: delegate to subsequent PlayerAllIn event.
+                            // No update here; PlayerAllIn will set total_committed.
+                        }
                     }
                 }
                 out.push(log(LogLevel::Debug, "core: action taken",
@@ -434,6 +460,10 @@ impl ClientCore {
                     if !h.all_in_seats.contains(&seat) {
                         h.all_in_seats.push(seat);
                     }
+                    // Best-effort: set the seat's street bet to total_committed.
+                    // This over-counts if prior streets contributed, but is
+                    // acceptable as a UI affordance (see design §D4).
+                    update_bet(&mut h.bet_this_street, seat, total_committed);
                 }
                 out.push(log(LogLevel::Debug, "core: player all-in",
                     &[("seat", seat.to_string()),
@@ -481,6 +511,15 @@ fn log(level: LogLevel, msg: &str, fields: &[(&'static str, String)]) -> Effect 
         level,
         message: msg.to_string(),
         fields: fields.to_vec(),
+    }
+}
+
+/// Update or insert the per-seat bet entry in `bet_this_street`.
+fn update_bet(bets: &mut Vec<(usize, u32)>, seat: usize, amount: u32) {
+    if let Some(entry) = bets.iter_mut().find(|(s, _)| *s == seat) {
+        entry.1 = amount;
+    } else {
+        bets.push((seat, amount));
     }
 }
 
@@ -896,5 +935,115 @@ mod tests {
         assert!(v.current_hand.unwrap().awaiting_action,
             "should re-arm so the user can try again");
         assert_eq!(v.last_action_rejection.as_deref(), Some("stale prompt"));
+    }
+
+    // ─── bet_this_street projection ─────────────────────────────
+
+    fn start_hand(core: &mut ClientCore) {
+        fire_event(core, EngineEvent::HandStarted { hand_id: 1, dealer: 0, deck_seed: 0 });
+    }
+
+    fn bet_entry(h: &crate::view::CurrentHand, seat: usize) -> Option<u32> {
+        h.bet_this_street.iter().find(|&&(s, _)| s == seat).map(|&(_, b)| b)
+    }
+
+    /// Scenario: Reset on new hand.
+    #[test]
+    fn bet_this_street_resets_on_new_hand() {
+        let mut core = ClientCore::new(None);
+        seat_alice(&mut core);
+        start_hand(&mut core);
+        // Populate some bets from a first hand.
+        fire_event(&mut core, EngineEvent::ActionTaken {
+            seat: 0, action: Action::Raise(10), pot_total: 10,
+        });
+        fire_event(&mut core, EngineEvent::ActionTaken {
+            seat: 1, action: Action::Call, pot_total: 20,
+        });
+        // Verify bets were set.
+        assert!(core.snapshot().current_hand.as_ref().unwrap().bet_this_street.len() >= 1);
+
+        // Start a new hand — bet_this_street must be empty.
+        fire_event(&mut core, EngineEvent::HandEnded {
+            hand_id: 1,
+            result: HandResult { hand_id: 1, board: vec![], seats: vec![] },
+        });
+        start_hand(&mut core);
+        let h = core.snapshot().current_hand.unwrap();
+        assert!(h.bet_this_street.is_empty(), "bet_this_street must reset on HandStarted");
+    }
+
+    /// Scenario: Reset on new street.
+    #[test]
+    fn bet_this_street_resets_on_new_street() {
+        let mut core = ClientCore::new(None);
+        seat_alice(&mut core);
+        start_hand(&mut core);
+        fire_event(&mut core, EngineEvent::ActionTaken {
+            seat: 0, action: Action::Raise(10), pot_total: 10,
+        });
+        fire_event(&mut core, EngineEvent::ActionTaken {
+            seat: 1, action: Action::Call, pot_total: 20,
+        });
+        // New street.
+        fire_event(&mut core, EngineEvent::BoardDealt {
+            street: Street::Flop,
+            cards: vec![],
+        });
+        let h = core.snapshot().current_hand.unwrap();
+        assert!(h.bet_this_street.is_empty(), "bet_this_street must clear on BoardDealt");
+    }
+
+    /// Scenario: Raise sets exact amount.
+    #[test]
+    fn bet_this_street_raise_sets_exact() {
+        let mut core = ClientCore::new(None);
+        seat_alice(&mut core);
+        start_hand(&mut core);
+        // Seat 0 raises to 30, seat 1 had 10 from blind.
+        fire_event(&mut core, EngineEvent::ActionTaken {
+            seat: 1, action: Action::Raise(10), pot_total: 10,
+        });
+        fire_event(&mut core, EngineEvent::ActionTaken {
+            seat: 0, action: Action::Raise(30), pot_total: 40,
+        });
+        let h = core.snapshot().current_hand.unwrap();
+        assert_eq!(bet_entry(&h, 0), Some(30), "seat 0 bet should be 30 after Raise(30)");
+        assert_eq!(bet_entry(&h, 1), Some(10), "seat 1 bet should remain 10");
+    }
+
+    /// Scenario: Call matches current max.
+    #[test]
+    fn bet_this_street_call_matches_max() {
+        let mut core = ClientCore::new(None);
+        seat_alice(&mut core);
+        start_hand(&mut core);
+        // Seat 0 raises to 30; seat 1 calls → should match 30.
+        fire_event(&mut core, EngineEvent::ActionTaken {
+            seat: 0, action: Action::Raise(30), pot_total: 30,
+        });
+        fire_event(&mut core, EngineEvent::ActionTaken {
+            seat: 1, action: Action::Call, pot_total: 60,
+        });
+        let h = core.snapshot().current_hand.unwrap();
+        assert_eq!(bet_entry(&h, 1), Some(30), "seat 1 Call should match max (30)");
+    }
+
+    /// Scenario: Fold does not remove entry.
+    #[test]
+    fn bet_this_street_fold_keeps_entry() {
+        let mut core = ClientCore::new(None);
+        seat_alice(&mut core);
+        start_hand(&mut core);
+        // Seat 1 has bet 10; seat 1 folds — entry must remain.
+        fire_event(&mut core, EngineEvent::ActionTaken {
+            seat: 1, action: Action::Raise(10), pot_total: 10,
+        });
+        fire_event(&mut core, EngineEvent::ActionTaken {
+            seat: 1, action: Action::Fold, pot_total: 10,
+        });
+        let h = core.snapshot().current_hand.unwrap();
+        assert_eq!(bet_entry(&h, 1), Some(10), "Fold must not remove bet_this_street entry");
+        assert!(h.folded_seats.contains(&1), "seat 1 should appear in folded_seats");
     }
 }

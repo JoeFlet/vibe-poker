@@ -435,6 +435,10 @@ async fn handle_leave(conn: &Arc<Connection>, ctx: &ServerContext, table_id: Tab
         });
         return;
     };
+    // Cancel any in-flight action prompt so `RemoteAgent::act` returns Fold
+    // immediately, eliminating the ~30s action-deadline stall for mid-hand leaves.
+    // See server-behavior spec: "Force-fold on mid-hand leave".
+    conn.cancel_pending();
     match table.leave(conn.player_id).await {
         Ok(()) => {
             ctx.tables.record_leave(conn.player_id).await;
