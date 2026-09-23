@@ -46,8 +46,10 @@ cd client && pnpm install && pnpm tauri dev     # separate terminal
 cd client && pnpm tauri:p2                      # second window, identifier com.poker.client.p2
 ```
 
-## Design Authority
+## Documentation map
 
-`DESIGN.md` is the authoritative numbered plan. Update it together with the README roadmap table when making nontrivial architectural changes.
-
-`openspec/specs/` carries the normative requirements for each subsystem. When a change modifies behavior (not just implementation), update the relevant spec delta and merge to main specs on archive.
+- `DESIGN.md` — terse, mile-high view of the **current and planned** design. Keep it a map, not a work log (history is what git is for). Update it when the shape of the project changes.
+- Each crate's `README.md` — in-depth design of that module. Update alongside nontrivial changes to the crate.
+- `FRONTIER.md` — the bleeding edge: work in flight, known breakage, next steps.
+- `crates/poker-engine/src/net/PROTOCOL.md` — long-form wire spec, versioned in lockstep with `PROTOCOL_VERSION`.
+- `openspec/specs/` — normative requirements per subsystem. When a change modifies behavior (not just implementation), update the relevant spec delta and merge to main specs on archive.

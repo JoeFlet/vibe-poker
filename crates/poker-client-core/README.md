@@ -32,7 +32,7 @@ The core is consumed by two hosts in this workspace:
 
 The Tauri glue in [client/src-tauri/](../../client/src-tauri/) drives the core indirectly through `NativeClient`.
 
-## Design rules (from [CLIENT_PRINCIPLES.md](../../../../docs/CLIENT_PRINCIPLES.md))
+## Design rules (the client principles — see [DESIGN.md](../../DESIGN.md#client-stack))
 
 - The core contains no `Instant`, no randomness, no clock. Anything that needs wall time goes through `Effect::Schedule` so tests drive timing manually.
 - `ClientView` is the whole authoritative client state. Hosts MUST NOT keep a parallel copy.

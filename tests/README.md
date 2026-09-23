@@ -28,6 +28,6 @@ cargo test -p poker-full-flow-tests  # just the cross-crate tests
 A test belongs at this level if it:
 
 - Spins up `poker-server` in-process and drives one or more headless clients through a real flow, **or**
-- Asserts cross-crate ordering / contract guarantees that no single crate can verify alone (e.g. DESIGN.md step 27: "if the server crashes mid-hand, the database state matches a never-started hand").
+- Asserts cross-crate ordering / contract guarantees that no single crate can verify alone (e.g. "if the server crashes mid-hand, the database state matches a never-started hand").
 
 Single-crate behaviour tests belong in that crate's own `tests/` directory.

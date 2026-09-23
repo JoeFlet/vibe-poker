@@ -39,10 +39,11 @@ The load-bearing trick is the bridge from synchronous `Engine::run_hand` (which 
 - **`RemoteAgent::act`** ([remote_agent.rs](src/remote_agent.rs)) — sync (must be, because `Agent` is sync). Sends a `Prompt` over the connection's outbound queue and `Handle::block_on`s a `oneshot` that the next inbound `SubmitAction` resolves. Missed deadlines auto-fold.
 - **`BroadcastSink`** ([table.rs](src/table.rs)) — fans `EngineEvent`s per-recipient with hole-card masking: `HoleCardsDealt` rides only to its owner; `HandEnded` reveals hole cards only at a proper showdown. Tests for this are in [tests/table_play.rs](tests/table_play.rs) — keep them green.
 - **`SeatLink`** ([connection.rs](src/connection.rs)) — an `Arc<RwLock<Arc<Connection>>>` indirection shared by the table seat, `RemoteAgent`, and `BroadcastSink`. On a second login for the same user, `Table::reconnect_player` swaps the link in place and re-issues any in-flight `Prompt` so the hand keeps going.
+- **Leave / disconnect mid-hand** — `LeaveTable` (and a graceful, non-superseded session close) during a live hand immediately force-folds the seat (cancelling any in-flight prompt) rather than stalling on its action deadline; the seat is removed at `HandEnded`. A superseded session (handoff to a newer login) is left alone — the new session keeps driving the seat.
 
 ## Wire protocol
 
-Defined once in [poker_engine::net::protocol](../poker-engine/src/net/protocol.rs) and linked by client and server. Frames are `[u32 LE length][rmp-serde bytes]` — same format `FileSink` uses. `PROTOCOL_VERSION` (currently **4**) is bumped on any backwards-incompatible change. Full spec at [crates/poker-engine/src/net/PROTOCOL.md](../poker-engine/src/net/PROTOCOL.md).
+Defined once in [poker_engine::net::protocol](../poker-engine/src/net/protocol.rs) and linked by client and server. Frames are `[u32 LE length][rmp-serde bytes]` — same format `FileSink` uses. `PROTOCOL_VERSION` (currently **5**) is bumped on any backwards-incompatible change. Full spec at [crates/poker-engine/src/net/PROTOCOL.md](../poker-engine/src/net/PROTOCOL.md).
 
 ## Persistence
 

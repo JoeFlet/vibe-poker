@@ -46,7 +46,7 @@ The wire format is the **compact** (default) `rmp-serde` encoding — `to_vec`, 
 - **`Card`** is a single byte 0–51: `(rank << 2) | suit`. Rank 0 = Two, …, 12 = Ace; suit 0 = Clubs, 1 = Diamonds, 2 = Hearts, 3 = Spades.
 - **Chip amounts** are unsigned 32-bit big-blind-denominated integers. There are no floats anywhere in the protocol. `chip_delta` (signed 32-bit) is the only signed chip field.
 
-> **Concrete example.** `ServerMessage::Welcome { protocol_version: 4, player_id: 1, username: "alice", session_key: "k", stats: LifetimeStats::default() }` encodes as the 28-byte sequence `81 a7 'Welcome' 95 04 01 a5 'alice' a1 'k' 97 00 00 00 00 00 00 00`: a one-key map (`81`) with key `"Welcome"`, whose value is a 5-element fixarray (`95`) holding the five struct fields, the last of which is itself a 7-element fixarray (`97`) for `LifetimeStats`. **No field-name strings appear on the wire.** A non-Rust client must decode by position, not by name. The invariant is pinned by `structs_serialize_as_positional_arrays_not_maps` in [`protocol.rs`](protocol.rs).
+> **Concrete example.** `ServerMessage::Welcome { protocol_version: 5, player_id: 1, username: "alice", session_key: "k", stats: LifetimeStats::default() }` encodes as the 28-byte sequence `81 a7 'Welcome' 95 05 01 a5 'alice' a1 'k' 97 00 00 00 00 00 00 00`: a one-key map (`81`) with key `"Welcome"`, whose value is a 5-element fixarray (`95`) holding the five struct fields, the last of which is itself a 7-element fixarray (`97`) for `LifetimeStats`. **No field-name strings appear on the wire.** A non-Rust client must decode by position, not by name. The invariant is pinned by `structs_serialize_as_positional_arrays_not_maps` in [`protocol.rs`](protocol.rs).
 
 ---
 
@@ -417,7 +417,7 @@ A client that retains its `session_key` from a prior `Welcome` may reconnect at 
 2. Send `Authenticate { protocol_version, mode: AuthMode::Session { key }, device_label }`.
 3. Wait for `Welcome`. If the prior session is still valid the server returns the same `player_id` and (typically) the same `session_key`.
 
-### 6.1 Mid-hand seat takeover (step 22c)
+### 6.1 Mid-hand seat takeover
 
 If the player is **currently seated and in a live hand** at the moment of the new login, the server hands the seat over to the new connection:
 

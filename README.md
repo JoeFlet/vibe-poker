@@ -87,7 +87,7 @@ Every meaningful moment in a hand emits an event: `HandStarted` / `HoleCardsDeal
 
 ### Wire protocol
 
-Defined once in [crates/poker-engine/src/net/](crates/poker-engine/src/net/) and linked by `poker-server`, `poker-client-core`, and the Tauri glue in `client/src-tauri/`. Same `[u32 LE length][rmp-serde bytes]` framing as `FileSink`, but carrying `ClientMessage` / `ServerMessage` envelopes. `PROTOCOL_VERSION` is currently **4**; bumped on any backwards-incompatible change. Long-form spec at [crates/poker-engine/src/net/PROTOCOL.md](crates/poker-engine/src/net/PROTOCOL.md).
+Defined once in [crates/poker-engine/src/net/](crates/poker-engine/src/net/) and linked by `poker-server`, `poker-client-core`, and the Tauri glue in `client/src-tauri/`. Same `[u32 LE length][rmp-serde bytes]` framing as `FileSink`, but carrying `ClientMessage` / `ServerMessage` envelopes. `PROTOCOL_VERSION` is currently **5**; bumped on any backwards-incompatible change. Long-form spec at [crates/poker-engine/src/net/PROTOCOL.md](crates/poker-engine/src/net/PROTOCOL.md).
 
 ## Workspace-wide invariants
 
@@ -95,23 +95,14 @@ Defined once in [crates/poker-engine/src/net/](crates/poker-engine/src/net/) and
 - **Integer chips.** Chip values are `u32`, BB-denominated. Split-pot remainders go to the first eligible winner left of the dealer. `SeatOutcome::chip_delta` is `i32`. No floating-point arithmetic.
 - **Hole-card visibility.** `HoleCardsDealt` is per-seat private. `HandEnded` reveals hole cards only at a proper showdown (river dealt + ≥2 non-folded contenders). The server's `BroadcastSink` enforces this per-recipient.
 
-## Roadmap
+## Design & status
 
-Full step-by-step plan lives in [DESIGN.md](DESIGN.md). Summary:
-
-| Steps | What | Status |
-|---|---|---|
-| 1–17 | Engine, sim, stats, MCCFR, blueprints, dataset | ✅ |
-| 18 | Persona bot pool + `poker_dataset` | ✅ |
-| 19a–c | TCP server skeleton, game messages | ✅ |
-| 20 | `poker-trainer` split from `poker-engine` | ✅ |
-| 21a–c | SQLite persistence — schema, Argon2id auth, per-hand log storage | ✅ |
-| 22a–c | Security hardening — wire-layer limits, idle timeout, rate-limit, reconnect mid-hand | ✅ |
-| 23 | `PROTOCOL.md` long-form wire spec | ✅ |
-| 24 | Deprecate old client; per-crate READMEs | ✅ |
-| 25a–d | New client architecture: core, transport, headless, Tauri shell | ✅ |
-| 26 | Server-side hand replay verb (`RequestReplay`), protocol v4 | ✅ |
-| 27 | Mid-hand persistence atomicity — verify + regression test | 🔲 |
+- [DESIGN.md](DESIGN.md) — the mile-high, current + planned design of the whole
+  workspace.
+- [FRONTIER.md](FRONTIER.md) — where the project actually is right now: work in
+  flight, known breakage, and the next things to build.
+- Each crate's own `README.md` — the in-depth design of that module.
+- [openspec/specs/](openspec/specs/) — normative per-subsystem requirements.
 
 ## Tests
 

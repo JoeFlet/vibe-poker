@@ -1,6 +1,6 @@
 # poker-trainer
 
-Agent-training scaffolding — split out of `poker-engine` in step 20 so the engine stays a focused rules library. Carries:
+Agent-training scaffolding — split out of `poker-engine` so the engine stays a focused rules library. Carries:
 
 - **`solver`** — external-sampling MCCFR for heads-up no-limit, regret tables, blueprint persistence (`BlueprintStrategy` / `StrategyAdapter` to plug a trained policy back into the engine's `Agent` trait).
 - **`dataset`** — `extract_hand_stats` / `class_conditional` / `windowed` aggregators that turn `FileSink` event logs into per-hand stat rows.
