@@ -125,6 +125,15 @@ pub struct HandRecord {
 pub struct Registry {
     pool: SqlitePool,
     online: Mutex<HashMap<PlayerId, OnlineEntry>>,
+    /// Serialises multi-statement write transactions. sqlx issues a
+    /// *deferred* `BEGIN`, so a read-then-write transaction takes a shared
+    /// lock on its first `SELECT` and only tries to upgrade to a writer on
+    /// its first `INSERT`. Two such transactions running at once each hold a
+    /// shared lock and deadlock on the upgrade — SQLite returns `SQLITE_BUSY`
+    /// immediately (it won't honour `busy_timeout` for a lock that could
+    /// never be granted). SQLite serialises writers anyway, so gating these
+    /// transactions here costs no real concurrency and removes the deadlock.
+    write_tx: Mutex<()>,
 }
 
 impl Registry {
@@ -135,6 +144,7 @@ impl Registry {
         Ok(Self {
             pool,
             online: Mutex::new(HashMap::new()),
+            write_tx: Mutex::new(()),
         })
     }
 
@@ -143,6 +153,7 @@ impl Registry {
         Ok(Self {
             pool,
             online: Mutex::new(HashMap::new()),
+            write_tx: Mutex::new(()),
         })
     }
 
@@ -172,6 +183,7 @@ impl Registry {
         let hash = hash_password(password)?;
         let now = unix_now();
 
+        let _write = self.write_tx.lock().await;
         let mut tx = self.pool.begin().await?;
 
         let username_taken: Option<(i64,)> =
@@ -245,6 +257,7 @@ impl Registry {
     ) -> Result<AuthSuccess, RegistryError> {
         let by_email = identifier.contains('@');
 
+        let _write = self.write_tx.lock().await;
         let mut tx = self.pool.begin().await?;
 
         let row: Option<(i64, String, i64, String)> = if by_email {
@@ -305,6 +318,7 @@ impl Registry {
     /// key; if the key is unknown or revoked the caller gets the
     /// matching error.
     pub async fn authenticate_session(&self, key: &str) -> Result<AuthSuccess, RegistryError> {
+        let _write = self.write_tx.lock().await;
         let mut tx = self.pool.begin().await?;
         let row: Option<(i64, i64, Option<i64>, String, i64)> = sqlx::query_as(
             r#"SELECT s.id, s.user_id, s.revoked_at, u.username, u.created_at
@@ -417,6 +431,7 @@ impl Registry {
         log: Vec<u8>,
         seats: &[HandSeatRecord],
     ) -> Result<i64, RegistryError> {
+        let _write = self.write_tx.lock().await;
         let mut tx = self.pool.begin().await?;
 
         let res = sqlx::query(
@@ -632,6 +647,30 @@ mod tests {
             .unwrap();
         assert_eq!(r2.record.player_id, id);
         assert_ne!(r2.session_key, r1.session_key, "new session each auth");
+    }
+
+    // Regression: two clients registering at the same instant used to
+    // deadlock on a SQLite write-lock upgrade (deferred `BEGIN` + concurrent
+    // read-then-write), surfacing to one client as `Rejected { "internal
+    // error" }`. Needs the on-disk pool (max_connections > 1) to reproduce;
+    // the in-memory pool is single-connection and serialises anyway.
+    #[tokio::test]
+    async fn concurrent_registration_of_distinct_users_both_succeed() {
+        let dir = tempdir().unwrap();
+        let reg = std::sync::Arc::new(Registry::open(dir.path()).await.unwrap());
+
+        let a = {
+            let reg = std::sync::Arc::clone(&reg);
+            tokio::spawn(async move { reg.register("alice@example.com", "alice", PW, None).await })
+        };
+        let b = {
+            let reg = std::sync::Arc::clone(&reg);
+            tokio::spawn(async move { reg.register("bob@example.com", "bob", PW, None).await })
+        };
+
+        let ra = a.await.unwrap().expect("alice register");
+        let rb = b.await.unwrap().expect("bob register");
+        assert_ne!(ra.record.player_id, rb.record.player_id);
     }
 
     #[tokio::test]
